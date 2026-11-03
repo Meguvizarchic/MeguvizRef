@@ -116,7 +116,7 @@ public final class QuerySpec {
         private Boolean staticOnly, bridge, synthetic;
         private int parameterCount = -1, candidateBudget = 16384, resultLimit = 4096, depthLimit = 256;
         private Builder(String owner, Class<?> runtimeOwner, MemberKind kind) {
-            TypeDescriptor.of("L" + Objects.requireNonNull(owner).replace('.', '/') + ";");
+            validateOwner(Objects.requireNonNull(owner));
             this.owner = owner.replace('/', '.'); // same result as the former substring/replace round trip
             this.runtimeOwner = runtimeOwner; this.kind = Objects.requireNonNull(kind);
         }
@@ -145,5 +145,22 @@ public final class QuerySpec {
         public Builder depthLimit(int count) { if (count < 1 || count > 1024) throw new IllegalArgumentException("depth"); depthLimit = count; return this; }
         public Builder provider(String id) { if (id == null || id.isEmpty() || id.length() > 256) throw new IllegalArgumentException("provider ID"); providerId = id; return this; }
         public QuerySpec build() { return new QuerySpec(this); }
+        /**
+         * Same checks and messages as {@code TypeDescriptor.of("L" + owner.replace('.', '/') + ";")} without building
+         * the string (a copy of TypeDescriptor's package-private validator; both are tested against the 1.0.0 oracle).
+         */
+        private static void validateOwner(String owner) {
+            int length = owner.length();
+            if (length > 4094) throw new IllegalArgumentException("descriptor length");
+            if (length == 0) throw new IllegalArgumentException("invalid descriptor: L;");
+            boolean previousSeparator = true;
+            for (int i = 0; i < length; i++) {
+                char c = owner.charAt(i);
+                boolean separator = c == '.' || c == '/';
+                if ((separator && previousSeparator) || c == ';' || c == '[' || c == '(' || c == ')' || Character.isWhitespace(c)) throw new IllegalArgumentException("reference name");
+                previousSeparator = separator;
+            }
+            if (previousSeparator) throw new IllegalArgumentException("reference name");
+        }
     }
 }

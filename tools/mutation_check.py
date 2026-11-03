@@ -1,6 +1,6 @@
-"""Opt-in mutation check for the CodeScope admission/close protocol (not part of verifyHost or CI).
+"""Opt-in mutation check for CodeScope admission/close, the cache-hit memo and the member-table memo (not in verifyHost/CI).
 
-Each mutation is a plausible broken variant of ref-core's CodeScope. The script copies ref-core sources and the test
+Each mutation is a plausible broken variant of ref-core's CodeScope or ReflectionResolver. The script copies ref-core sources and the test
 fixtures to build/mutation/<id>/, applies one textual mutation, compiles with javac --release 17 and runs
 CoreContractTest. A mutation is "caught" when the contract run fails. The unmutated control must pass.
 
@@ -10,7 +10,7 @@ With --jcstress the mutated ref-core classes are prepended to the stress-jvm cla
 instead (first: bash gradlew -Pmeguviz.jcstress=true :stress-jvm:jcstressClasspath). A mutation is caught when any
 jcstress test fails.
 
-    python3 tools/mutation_check.py --jcstress [--jcstress-args "-m quick -jvmArgs -Xmx1g -sc false -t Admission"]
+    python3 tools/mutation_check.py --jcstress [--jcstress-args "-m quick -jvmArgs -Xmx1g -sc false"]
 """
 import argparse
 import os
@@ -24,6 +24,8 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 SCOPE = "ref-core/src/main/java/io/github/jichuo1/meguviz/ref/scope/CodeScope.java"
 
+RESOLVER = "ref-core/src/main/java/io/github/jichuo1/meguviz/ref/runtime/resolve/ReflectionResolver.java"
+# (id, description, anchor, replacement[, file[, jcstress test regex]])
 MUTATIONS = [
     ("close-skips-cells", "close sets CLOSING only on the base word and treats every cell as idle",
      "for (int cell = 1; cell <= CELLS; cell++) if (table.getAndAdd(cell * STRIDE, CLOSING) == 0) idle++;",
@@ -51,7 +53,18 @@ MUTATIONS = [
      "if (cells == null) { Thread.yield(); cells = new AtomicIntegerArray((CELLS + 2) * STRIDE); }"),
     ("idle-shortcut-always", "close always treats the hand-off as its own",
      "drained = idle == CELLS + 1 || table.addAndGet(PENDING, -(idle + 1)) == 0;", "drained = true;"),
+    ("memo-survives-put", "a cache put keeps the most-recent memo (no longer the LRU tail)",
+     "cache.put(query, result); if (recent != null) recent = null;", "cache.put(query, result);", SCOPE, "MemoStress"),
+    ("memo-survives-close", "close keeps the most-recent memo",
+     "bindings = Bindings.CLOSED; cache.clear(); if (recent != null) recent = null;", "bindings = Bindings.CLOSED; cache.clear();", SCOPE, "MemoStress"),
+    ("memo-survives-epoch", "advanceCodeEpoch keeps the most-recent memo",
+     "cache.clear(); if (recent != null) recent = null; memberSlots.clear(); bindings = new Bindings", "cache.clear(); memberSlots.clear(); bindings = new Bindings", SCOPE, "MemoStress"),
+    ("table-memo-stale-after-hit", "a member-table map hit does not move the table memo",
+     "if (cached != null) { lastTable = new LastTable(owner, shape, cached); return cached; }", "if (cached != null) return cached;", RESOLVER),
+    ("table-memo-survives-clear", "clear keeps the member-table memo",
+     "tableMembers = 0; lastTable = null; }", "tableMembers = 0; }", RESOLVER),
 ]
+
 # Mutations applied together under one id.
 GROUPS = {"pending-after-closing": ["pending-after-closing", "pending-after-closing-placed"]}
 HIDDEN = {"pending-after-closing-placed"}
@@ -72,16 +85,15 @@ def prepare(name, edits):
     if target.exists(): shutil.rmtree(target)
     shutil.copytree(ROOT / "ref-core/src", target / "ref-core/src")
     shutil.copytree(ROOT / "test-fixtures", target / "test-fixtures")
-    source = target / SCOPE
-    text = source.read_text(encoding="utf-8")
-    for old, new in edits:
+    for file, old, new in edits:
+        source = target / file
+        text = source.read_text(encoding="utf-8")
         if text.count(old) != 1: raise SystemExit(f"{name}: mutation anchor found {text.count(old)} times: {old!r}")
-        text = text.replace(old, new)
-    source.write_text(text, encoding="utf-8")
+        source.write_text(text.replace(old, new), encoding="utf-8")
     return target
 
 
-def check_jcstress(name, edits, timeout, extra):
+def check_jcstress(name, edits, timeout, extra, tests):
     root = prepare(name, edits)
     classpath_file = ROOT / "stress-jvm/build/jcstress-classpath.txt"
     if not classpath_file.is_file(): raise SystemExit("run :stress-jvm:jcstressClasspath with -Pmeguviz.jcstress=true first")
@@ -91,7 +103,7 @@ def check_jcstress(name, edits, timeout, extra):
     if code != 0: return "compile-error", log, 0.0
     classpath = os.pathsep.join([str(out / "main"), classpath_file.read_text(encoding="utf-8").strip()])
     work = root / "jcstress"; work.mkdir()
-    code, log, seconds = run(["java", "-cp", classpath, "org.openjdk.jcstress.Main", "-r", str(work / "report"), *extra.split()], work, timeout)
+    code, log, seconds = run(["java", "-cp", classpath, "org.openjdk.jcstress.Main", "-r", str(work / "report"), *extra.split(), "-t", tests], work, timeout)
     if code is None: return "timeout", log, seconds
     totals = re.findall(r"Results: (\d+) planned; (\d+) passed, (\d+) failed", log)
     failed = int(totals[-1][2]) if totals else 0
@@ -118,9 +130,10 @@ def main():
     parser.add_argument("--only", default="")
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--jcstress", action="store_true")
-    parser.add_argument("--jcstress-args", default="-m quick -jvmArgs -Xmx1g -sc false -t AdmissionStress")
+    parser.add_argument("--jcstress-args", default="-m quick -jvmArgs -Xmx1g -sc false")
     args = parser.parse_args()
-    runner = (lambda name, edits, timeout: check_jcstress(name, edits, timeout, args.jcstress_args)) if args.jcstress else check
+    def runner(name, edits, timeout, tests="AdmissionStress|MemoStress"):
+        return check_jcstress(name, edits, timeout, args.jcstress_args, tests) if args.jcstress else check(name, edits, timeout)
     by_id = {m[0]: m for m in MUTATIONS}
     selected = [m[0] for m in MUTATIONS if m[0] not in HIDDEN]
     if args.only: selected = args.only.split(",")
@@ -130,8 +143,9 @@ def main():
         print(log[-4000:]); return 1
     caught = True
     for name in selected:
-        edits = [(by_id[part][2], by_id[part][3]) for part in GROUPS.get(name, [name])]
-        status, log, seconds = runner(name, edits, args.timeout)
+        parts = [by_id[part] for part in GROUPS.get(name, [name])]
+        edits = [(m[4] if len(m) > 4 else SCOPE, m[2], m[3]) for m in parts]
+        status, log, seconds = runner(name, edits, args.timeout, parts[0][5] if len(parts[0]) > 5 else "AdmissionStress")
         (ROOT / "build/mutation" / name / "run.log").write_text(log, encoding="utf-8")
         failed = sorted(set(re.findall(r"^FAIL (\S+)", log, re.M)))
         if args.jcstress: failed = sorted(set(re.findall(r"^\s+\[FAILED\]\s+(\S+)", log, re.M)))

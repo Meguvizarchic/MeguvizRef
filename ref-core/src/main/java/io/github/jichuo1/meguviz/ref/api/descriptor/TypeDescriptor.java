@@ -34,6 +34,24 @@ public final class TypeDescriptor {
         } else throw new IllegalArgumentException("invalid descriptor: " + value);
         return new TypeDescriptor(value);
     }
+    /**
+     * Same checks and messages as {@code of("L" + owner.replace('.', '/') + ";")} without building that string: the
+     * name is non-empty, at most 4094 characters, has no leading, trailing or doubled separator ('.' or '/'), and no
+     * ';', '[', '(', ')' or whitespace. Every failure of that call carries one of the three messages used here.
+     */
+    static void validateOwner(String owner) {
+        int length = owner.length();
+        if (length > 4094) throw new IllegalArgumentException("descriptor length");
+        if (length == 0) throw new IllegalArgumentException("invalid descriptor: L;");
+        boolean previousSeparator = true; // a leading separator is rejected like a doubled one
+        for (int i = 0; i < length; i++) {
+            char c = owner.charAt(i);
+            boolean separator = c == '.' || c == '/';
+            if ((separator && previousSeparator) || c == ';' || c == '[' || c == '(' || c == ')' || Character.isWhitespace(c)) throw new IllegalArgumentException("reference name");
+            previousSeparator = separator;
+        }
+        if (previousSeparator) throw new IllegalArgumentException("reference name");
+    }
     public static TypeDescriptor fromClass(Class<?> type) {
         if (type.isArray()) return of(type.getName().replace('.', '/'));
         if (!type.isPrimitive()) return of("L" + type.getName().replace('.', '/') + ";");

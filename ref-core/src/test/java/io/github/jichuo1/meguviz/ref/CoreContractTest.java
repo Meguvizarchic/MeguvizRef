@@ -1158,7 +1158,9 @@ public final class CoreContractTest {
                 eq(ResolutionStatus.RESOLVED, scope.resolve(c).status()); // evicts a: b was used after a
                 long lookups = scope.diagnostics().get("lookups");
                 check(scope.resolve(b) == rb, "b still cached"); eq(lookups, scope.diagnostics().get("lookups"));
-                scope.resolve(a); eq(lookups + 1, scope.diagnostics().get("lookups"));
+                scope.resolve(a); eq(lookups + 1, scope.diagnostics().get("lookups")); // evicts c: b was used after c's put
+                check(scope.resolve(b) == rb, "b survived a's put"); eq(lookups + 1, scope.diagnostics().get("lookups"));
+                scope.resolve(c); eq(lookups + 2, scope.diagnostics().get("lookups"));
             }
         });
         test("recent-hit-memo-interrupt-closed-and-epoch", () -> {
@@ -1251,6 +1253,40 @@ public final class CoreContractTest {
                 check(memberTables(scope) <= target + arity, "bounded");
             }
         });
+        test("member-table-memo-follows-lru-tail", () -> {
+            int target = Target.class.getDeclaredMethods().length, arity = ArityFixture.class.getDeclaredMethods().length, child = Child.class.getDeclaredMethods().length;
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, Math.max(target + arity, Math.max(target, arity) + child))) {
+                scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").build()).requireSingle();
+                scope.resolve(QuerySpec.builder(ArityFixture.class, MemberKind.METHOD).name("choose").parameterCount(0).build()).requireSingle();
+                for (int i = 0; i < 3; i++) scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("one").candidateBudget(5000 + i).build()).requireSingle();
+                for (int i = 0; i < 3; i++) scope.resolve(QuerySpec.builder(ArityFixture.class, MemberKind.METHOD).name("choose").parameterCount(1).candidateBudget(5000 + i).build());
+                eq(target + arity, memberTables(scope));
+                scope.resolve(QuerySpec.builder(Child.class, MemberKind.METHOD).name("covariant").bridge(false).build()).requireSingle();
+                eq(arity + child, memberTables(scope)); // Target was least recently used
+            }
+        });
+        test("member-table-memo-cleared-with-tables", () -> {
+            CodeScope scope = CodeScope.open(LOADER);
+            scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").build()).requireSingle();
+            Object first = field(CodeScope.class, "resolver").get(scope); Field last = field(ReflectionResolver.class, "lastTable");
+            check(last.get(first) != null, "memo set by the lookup");
+            scope.advanceCodeEpoch("memo"); eq(null, last.get(first)); eq(0, memberTables(scope));
+            scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("one").build()).requireSingle();
+            Object second = field(CodeScope.class, "resolver").get(scope); check(last.get(second) != null, "new resolver memo");
+            scope.close(); eq(null, last.get(second)); eq(0, memberTables(scope));
+        });
+        test("coverage-universe-text-unchanged-across-owners-and-hierarchies", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER)) {
+                for (int round = 0; round < 3; round++)
+                    for (Class<?> owner : new Class<?>[]{Target.class, Child.class, Target.class, ArityFixture.class})
+                        for (Hierarchy hierarchy : Hierarchy.values()) {
+                            QuerySpec query = QuerySpec.builder(owner, MemberKind.METHOD).name("pick").selection(Selection.ALL).hierarchy(hierarchy).candidateBudget(1000 + round).build();
+                            eq("java-visible:" + owner.getName() + ":" + hierarchy, scope.resolve(query).receipt().coverage().universe());
+                            QuerySpec named = QuerySpec.builder(new String(owner.getName()), MemberKind.METHOD).name("zero").hierarchy(hierarchy).candidateBudget(1000 + round).build();
+                            eq("java-visible:" + owner.getName() + ":" + hierarchy, scope.resolve(named).receipt().coverage().universe());
+                        }
+            }
+        });
         test("member-table-cache-cleared-by-epoch-and-close", () -> {
             CodeScope scope = CodeScope.open(LOADER);
             scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").build()).requireSingle(); check(memberTables(scope) > 0, "retained");
@@ -1297,10 +1333,15 @@ public final class CoreContractTest {
         test("owner-normalization-matches-previous-implementation", () -> {
             Runnable lambda = () -> { };
             String hidden = lambda.getClass().getName(); check(hidden.indexOf('/') > 0, "lambda proxy is a hidden class: " + hidden);
-            for (String owner : new String[]{"java.lang.String", "java/lang/String", "a.b/c", hidden, "a..b", "a//b", ".a", "a.", "/a", "a/", "a;b", "a b", "a[]", "", "x".repeat(4094), "x".repeat(4095)}) {
+            List<String> owners = new ArrayList<>(Arrays.asList("java.lang.String", "java/lang/String", "a.b/c", hidden, "a..b", "a//b", "a./b", "a/.b", ".a", "a.", "/a", "a/", ".", "/", "a;b", "a b", "a\tb", "a\u2003b", "a\u00a0b", "a[]", "a(b", "a)b", "L", ";", "", "x".repeat(4094), "x".repeat(4095), "x".repeat(4093) + ".", "." + "x".repeat(4094)));
+            Random random = new Random(7); String alphabet = "./;[()ab L$\t\u2003\u00a0";
+            for (int i = 0; i < 20000; i++) { StringBuilder value = new StringBuilder(); int length = random.nextInt(7); for (int c = 0; c < length; c++) value.append(alphabet.charAt(random.nextInt(alphabet.length()))); owners.add(value.toString()); }
+            for (String owner : owners) {
                 eq(outcome(() -> previousOwner(owner)), outcome(() -> MemberDescriptor.field(owner, "f", "I").owner()));
                 eq(outcome(() -> previousOwner(owner)), outcome(() -> QuerySpec.builder(owner, MemberKind.FIELD).build().owner()));
             }
+            eq(outcome(() -> previousOwner(null)), outcome(() -> MemberDescriptor.field(null, "f", "I").owner()));
+            eq(outcome(() -> previousOwner(null)), outcome(() -> QuerySpec.builder((String) null, MemberKind.FIELD).build().owner()));
             Method run = lambda.getClass().getDeclaredMethod("run");
             eq(previousOwner(hidden), MemberDescriptor.from(run).owner()); eq(MemberDescriptor.from(run), new MethodSchema(run).descriptor());
         });
