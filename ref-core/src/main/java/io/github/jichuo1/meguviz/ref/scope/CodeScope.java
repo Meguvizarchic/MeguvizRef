@@ -67,7 +67,10 @@ public final class CodeScope implements AutoCloseable {
             context = new Context(loader, identity, codeEpoch, resolver, coordinator, providers, codeFingerprint);
         }
         try {
-            return context.coordinator.execute(query, () -> resolveUncached(query, context), 2000);
+            return context.coordinator.execute(query, () -> resolveUncached(query, context), 2000, interrupted -> {
+                Thread.currentThread().interrupt();
+                return failure(query, ResolutionStatus.CANCELLED, "wait_interrupted", ResolutionReceipt.InterruptionOrigin.SINGLE_FLIGHT_WAITER);
+            });
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt(); return failure(query, ResolutionStatus.CANCELLED, "wait_interrupted");
         } catch (TimeoutException e) { return failure(query, ResolutionStatus.PARTIAL, "single_flight_timeout"); }
@@ -87,9 +90,16 @@ public final class CodeScope implements AutoCloseable {
         ReflectionResolver.Outcome outcome = context.resolver.resolve(query, context.loader, context.providers, context.codeFingerprint);
         synchronized (lock) {
             if (!current(context)) return failure(query, ResolutionStatus.STALE, "scope_invalidated");
-            Set<Member> missing = new HashSet<>();
-            for (ReflectionResolver.Entry entry : outcome.entries) if (!memberSlots.containsKey(entry.member)) missing.add(entry.member);
-            if ((long) slots.size() + missing.size() > capacity) return failure(query, ResolutionStatus.PARTIAL, "binding_capacity");
+            // Resolver outcomes are distinct by Member: structural uses visited, provider uses seen, and exact has one entry.
+            int missing = 0;
+            for (ReflectionResolver.Entry entry : outcome.entries) if (!memberSlots.containsKey(entry.member)) missing++;
+            if ((long) slots.size() + missing > capacity) {
+                if (outcome.status == ResolutionStatus.CANCELLED) {
+                    ResolutionReceipt receipt = new ResolutionReceipt(query.summary(), query.selection(), outcome.status, outcome.coverage, Collections.emptyList(), outcome.reason, outcome.cause);
+                    return new ResolutionResult(outcome.status, Collections.emptyList(), receipt);
+                }
+                return failure(query, ResolutionStatus.PARTIAL, "binding_capacity");
+            }
             List<ResolvedMember> members = new ArrayList<>();
             List<MemberDescriptor> descriptors = new ArrayList<>();
             for (ReflectionResolver.Entry entry : outcome.entries) {
@@ -108,8 +118,11 @@ public final class CodeScope implements AutoCloseable {
     }
     private boolean current(Context context) { return state == State.OPEN && identity.equals(context.identity) && codeEpoch == context.epoch; }
     private static ResolutionResult failure(QuerySpec query, ResolutionStatus status, String reason) {
+        return failure(query, status, reason, ResolutionReceipt.InterruptionOrigin.UNKNOWN);
+    }
+    private static ResolutionResult failure(QuerySpec query, ResolutionStatus status, String reason, ResolutionReceipt.InterruptionOrigin origin) {
         Coverage coverage = new Coverage("java-visible:" + query.owner() + ":" + query.hierarchy(), false, 0, reason);
-        return new ResolutionResult(status, Collections.emptyList(), new ResolutionReceipt(query.summary(), query.selection(), status, coverage, Collections.emptyList(), reason, null));
+        return new ResolutionResult(status, Collections.emptyList(), new ResolutionReceipt(query.summary(), query.selection(), status, coverage, Collections.emptyList(), reason, null, origin));
     }
     public MethodPlan bindMethod(ResolvedMember member) throws IllegalAccessException { prepare(member, MemberKind.METHOD); return new MethodPlan(this, member); }
     public FieldPlan bindField(ResolvedMember member) throws IllegalAccessException { prepare(member, MemberKind.FIELD); return new FieldPlan(this, member); }
@@ -190,7 +203,11 @@ public final class CodeScope implements AutoCloseable {
         previous.close();
         if (retired != null) {
             try { retired.close(); }
-            catch (RuntimeException failure) { closeFailureType = failure.getClass().getName(); throw failure; }
+            catch (Throwable failure) {
+                closeFailureType = failure.getClass().getName();
+                if (failure instanceof InterruptedException) Thread.currentThread().interrupt();
+                throw rethrow(failure);
+            }
         }
     }
     private void release() {
@@ -201,9 +218,14 @@ public final class CodeScope implements AutoCloseable {
         }
         if (retired != null) {
             try { retired.close(); }
-            catch (RuntimeException failure) { closeFailureType = failure.getClass().getName(); }
+            catch (Throwable failure) {
+                closeFailureType = failure.getClass().getName();
+                if (failure instanceof InterruptedException) Thread.currentThread().interrupt();
+                if (failure instanceof Error) throw (Error) failure;
+            }
         }
     }
+    @SuppressWarnings("unchecked") private static <T extends Throwable> RuntimeException rethrow(Throwable failure) throws T { throw (T) failure; }
     private static final class Slot {
         final Member member;
         final MemberDescriptor descriptor;

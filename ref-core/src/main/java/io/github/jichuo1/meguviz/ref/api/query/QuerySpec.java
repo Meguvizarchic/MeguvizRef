@@ -18,6 +18,7 @@ public final class QuerySpec {
     private final Boolean staticOnly, bridge, synthetic;
     private final int parameterCount, candidateBudget, resultLimit, depthLimit;
     private final String providerId;
+    private final int hash;
     private QuerySpec(Builder b) {
         owner = b.owner; runtimeOwner = b.runtimeOwner; kind = b.kind; name = b.name;
         parameterClasses = b.parameterClasses == null ? null : b.parameterClasses.clone();
@@ -27,6 +28,28 @@ public final class QuerySpec {
         parameterCount = b.parameterCount; candidateBudget = b.candidateBudget; resultLimit = b.resultLimit; depthLimit = b.depthLimit; providerId = b.providerId;
         if (selection == Selection.EXACT && exact == null) throw new IllegalArgumentException("EXACT requires a complete portable descriptor");
         if (kind == MemberKind.CONSTRUCTOR && hierarchy != Hierarchy.DECLARED) throw new IllegalArgumentException("constructors are not inherited");
+        // Same values and order as Objects.hash, without its varargs array and integer boxing.
+        int value = 1;
+        value = 31 * value + Objects.hashCode(owner);
+        value = 31 * value + Objects.hashCode(name);
+        value = 31 * value + Objects.hashCode(kind);
+        value = 31 * value + Objects.hashCode(exact);
+        value = 31 * value + Objects.hashCode(hierarchy);
+        value = 31 * value + Objects.hashCode(selection);
+        value = 31 * value + Objects.hashCode(compatibility);
+        value = 31 * value + Objects.hashCode(staticOnly);
+        value = 31 * value + Objects.hashCode(bridge);
+        value = 31 * value + Objects.hashCode(synthetic);
+        value = 31 * value + parameterCount;
+        value = 31 * value + candidateBudget;
+        value = 31 * value + resultLimit;
+        value = 31 * value + depthLimit;
+        value = 31 * value + Objects.hashCode(providerId);
+        value = 31 * value + Objects.hashCode(runtimeOwner);
+        value = 31 * value + Objects.hashCode(returnClass);
+        value = 31 * value + Arrays.hashCode(parameterClasses);
+        value = 31 * value + Arrays.hashCode(argumentClasses);
+        hash = value;
     }
     public static QuerySpec exact(MemberDescriptor descriptor) {
         return new Builder(descriptor.owner(), null, descriptor.kind()).exact(descriptor).build();
@@ -65,7 +88,7 @@ public final class QuerySpec {
                 && parameterCount == q.parameterCount && candidateBudget == q.candidateBudget && resultLimit == q.resultLimit
                 && depthLimit == q.depthLimit && Objects.equals(providerId, q.providerId);
     }
-    @Override public int hashCode() { return Objects.hash(owner, name, kind, exact, hierarchy, selection, compatibility, staticOnly, bridge, synthetic, parameterCount, candidateBudget, resultLimit, depthLimit, providerId, runtimeOwner, returnClass, Arrays.hashCode(parameterClasses), Arrays.hashCode(argumentClasses)); }
+    @Override public int hashCode() { return hash; }
     public static final class Builder {
         private final String owner;
         private final Class<?> runtimeOwner;
@@ -80,7 +103,9 @@ public final class QuerySpec {
         private Boolean staticOnly, bridge, synthetic;
         private int parameterCount = -1, candidateBudget = 16384, resultLimit = 4096, depthLimit = 256;
         private Builder(String owner, Class<?> runtimeOwner, MemberKind kind) {
-            this.owner = MemberDescriptor.field(owner, "_", "I").owner(); this.runtimeOwner = runtimeOwner; this.kind = Objects.requireNonNull(kind);
+            TypeDescriptor ownerType = TypeDescriptor.of("L" + Objects.requireNonNull(owner).replace('.', '/') + ";");
+            this.owner = ownerType.value().substring(1, ownerType.value().length() - 1).replace('/', '.');
+            this.runtimeOwner = runtimeOwner; this.kind = Objects.requireNonNull(kind);
         }
         private Builder exact(MemberDescriptor descriptor) { exact = descriptor; name = descriptor.name(); selection = Selection.EXACT; return this; }
         public Builder name(String value) { if (value == null || value.length() > 1024 || value.isEmpty()) throw new IllegalArgumentException("name"); name = value; return this; }

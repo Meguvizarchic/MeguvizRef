@@ -1,5 +1,6 @@
 {
   "fixture_classpath": "excluded from parent classpath; URLClassLoader parent=null",
+  "scope": "Historical 1.0.0 fixture snapshot; current test fixtures and compiler output may differ.",
   "schema_major": 1,
   "entries": [
     {

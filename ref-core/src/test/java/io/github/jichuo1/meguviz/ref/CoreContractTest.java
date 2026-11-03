@@ -33,6 +33,7 @@ public final class CoreContractTest {
         structuralContracts();
         lifecycleAndLoaderContracts();
         providerContracts();
+        providerArityContracts();
         concurrencyContracts();
         if (args.length > 0) {
             Path output = Path.of(args[0]); Files.createDirectories(output.toAbsolutePath().getParent());
@@ -203,7 +204,67 @@ public final class CoreContractTest {
         test("raw-member-outlives-close", () -> { CodeScope scope = CodeScope.open(LOADER); Method raw = (Method) scope.exportRaw(scope.resolve(QuerySpec.exact(descriptor("zero", "I"))).requireSingle()); scope.close(); eq(0, raw.invoke(new Target())); });
         test("cache-only-complete-success", () -> { try (CodeScope scope = CodeScope.open(LOADER)) { QuerySpec success = QuerySpec.exact(descriptor("zero", "I")); scope.resolve(success); scope.resolve(success); eq(1L, scope.diagnostics().get("cacheHits")); QuerySpec partial = QuerySpec.builder(Target.class, MemberKind.METHOD).name("missing").candidateBudget(1).build(); scope.resolve(partial); scope.resolve(partial); eq(1L, scope.diagnostics().get("cachedQueries")); } });
         test("bounded-live-bindings-explicit-partial", () -> { try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 1)) { MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(descriptor("zero", "I"))).requireSingle()); eq(ResolutionStatus.PARTIAL, scope.resolve(QuerySpec.exact(descriptor("one", "I", "I"))).status()); eq(0, plan.invoke(new Target(), new Object[0])); eq(1L, scope.diagnostics().get("bindings")); } });
+        test("mixed-existing-and-new-bindings-capacity", () -> {
+            MemberDescriptor stringPick = descriptor("pick", "Ljava/lang/String;", "Ljava/lang/String;");
+            MemberDescriptor numberPick = descriptor("pick", "Ljava/lang/String;", "Ljava/lang/Number;");
+            QuerySpec both = QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").selection(Selection.ALL).build();
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 2)) {
+                ResolvedMember prior = scope.resolve(QuerySpec.exact(stringPick)).requireSingle();
+                MethodPlan existing = scope.bindMethod(prior); ResolutionResult full = scope.resolve(both);
+                eq(ResolutionStatus.ALL_MATCHES, full.status()); check(full.receipt().coverage().complete(), "complete mixed result");
+                eq(new HashSet<>(Arrays.asList(stringPick, numberPick)), new HashSet<>(full.receipt().descriptors()));
+                eq(2, full.members().size()); eq(2L, scope.diagnostics().get("bindings"));
+                ResolvedMember number = null;
+                for (ResolvedMember token : full.members()) {
+                    if (token.descriptor().equals(stringPick)) eq(prior.slot(), token.slot());
+                    if (token.descriptor().equals(numberPick)) number = token;
+                }
+                check(number != null, "new member bound"); eq("string", existing.invoke(new Target(), new Object[]{"x"}));
+                eq("number", scope.bindMethod(number).invoke(new Target(), new Object[]{1}));
+            }
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 2)) {
+                MethodPlan existing = scope.bindMethod(scope.resolve(QuerySpec.exact(stringPick)).requireSingle());
+                MethodPlan other = scope.bindMethod(scope.resolve(QuerySpec.exact(descriptor("zero", "I"))).requireSingle());
+                ResolutionResult overflow = scope.resolve(both);
+                eq(ResolutionStatus.PARTIAL, overflow.status()); eq("binding_capacity", overflow.receipt().reason());
+                check(overflow.members().isEmpty() && overflow.receipt().descriptors().isEmpty(), "over-capacity result has no new bindings");
+                eq(2L, scope.diagnostics().get("bindings")); eq("string", existing.invoke(new Target(), new Object[]{"x"}));
+                eq(0, other.invoke(new Target(), new Object[0]));
+            }
+        });
         test("bounded-query-cache-eviction", () -> { try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 1)) { scope.resolve(QuerySpec.exact(descriptor("zero", "I"))); scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").parameters().build()); eq(1L, scope.diagnostics().get("cachedQueries")); } });
+        test("query-lru-access-order-baseline", () -> {
+            CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 2);
+            try {
+                QuerySpec a = QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").selection(Selection.ALL).candidateBudget(127).build();
+                QuerySpec b = QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").selection(Selection.ALL).candidateBudget(128).build();
+                QuerySpec c = QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").selection(Selection.ALL).candidateBudget(256).build();
+                ResolutionResult first = scope.resolve(a); eq(ResolutionStatus.ALL_MATCHES, first.status()); eq(1L, scope.diagnostics().get("lookups"));
+                eq(ResolutionStatus.ALL_MATCHES, scope.resolve(b).status()); eq(2L, scope.diagnostics().get("lookups"));
+                eq(first, scope.resolve(a)); eq(1L, scope.diagnostics().get("cacheHits")); eq(2L, scope.diagnostics().get("lookups"));
+                eq(ResolutionStatus.ALL_MATCHES, scope.resolve(c).status()); eq(3L, scope.diagnostics().get("lookups"));
+                eq(ResolutionStatus.ALL_MATCHES, scope.resolve(b).status()); eq(4L, scope.diagnostics().get("lookups"));
+                eq(1L, scope.diagnostics().get("cacheHits")); eq(2L, scope.diagnostics().get("cachedQueries"));
+                eq(1L, scope.diagnostics().get("bindings")); MethodPlan plan = scope.bindMethod(first.members().get(0)); eq(0, plan.invoke(new Target(), new Object[0]));
+                scope.advanceCodeEpoch("lru baseline"); eq(0L, scope.diagnostics().get("cachedQueries")); eq(0L, scope.diagnostics().get("schemas")); eq(0L, scope.diagnostics().get("bindings"));
+                expect(StalePlanException.class, () -> plan.invoke(new Target(), new Object[0]));
+            } finally { scope.close(); }
+            eq(0L, scope.diagnostics().get("cachedQueries")); eq(0L, scope.diagnostics().get("schemas")); eq(0L, scope.diagnostics().get("bindings"));
+        });
+        test("schema-lru-access-order-baseline", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 2)) {
+                QuerySpec a = QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").returns(String.class).selection(Selection.ALL).build();
+                QuerySpec b = QuerySpec.builder(Target.class, MemberKind.METHOD).name("one").returns(String.class).selection(Selection.ALL).build();
+                QuerySpec c = QuerySpec.builder(Target.class, MemberKind.METHOD).name("four").returns(String.class).selection(Selection.ALL).build();
+                eq(ResolutionStatus.NOT_FOUND_IN_VISIBLE_UNIVERSE, scope.resolve(a).status()); eq(1L, scope.diagnostics().get("parameterReads"));
+                eq(ResolutionStatus.NOT_FOUND_IN_VISIBLE_UNIVERSE, scope.resolve(b).status()); eq(2L, scope.diagnostics().get("parameterReads"));
+                eq(ResolutionStatus.NOT_FOUND_IN_VISIBLE_UNIVERSE, scope.resolve(a).status()); eq(2L, scope.diagnostics().get("parameterReads"));
+                eq(ResolutionStatus.NOT_FOUND_IN_VISIBLE_UNIVERSE, scope.resolve(c).status()); eq(3L, scope.diagnostics().get("parameterReads"));
+                eq(ResolutionStatus.NOT_FOUND_IN_VISIBLE_UNIVERSE, scope.resolve(b).status()); eq(4L, scope.diagnostics().get("parameterReads"));
+                eq(2L, scope.diagnostics().get("schemas")); eq(0L, scope.diagnostics().get("cachedQueries")); eq(0L, scope.diagnostics().get("bindings"));
+                scope.advanceCodeEpoch("schema lru baseline"); eq(0L, scope.diagnostics().get("schemas")); eq(0L, scope.diagnostics().get("parameterReads"));
+            }
+        });
         test("close-releases-owned-graphs", () -> { CodeScope scope = CodeScope.open(LOADER); scope.resolve(QuerySpec.exact(descriptor("zero", "I"))); scope.close(); eq(0L, scope.diagnostics().get("bindings")); eq(0L, scope.diagnostics().get("schemas")); eq(0L, scope.diagnostics().get("cachedQueries")); check(!scope.usesLoader(LOADER), "closed identity"); Field loader = CodeScope.class.getDeclaredField("loader"); loader.setAccessible(true); eq(null, loader.get(scope)); });
         test("MVX-L03-two-loader-identity", () -> {
             try (URLClassLoader a = isolated(fixtures); URLClassLoader b = isolated(fixtures); CodeScope one = CodeScope.open(a); CodeScope two = CodeScope.open(b)) {
@@ -211,6 +272,40 @@ public final class CoreContractTest {
                 QuerySpec portable = QuerySpec.exact(MemberDescriptor.method("fixture.LoaderFixture", "echo", "Lfixture/LoaderFixture;", "Lfixture/LoaderFixture;"));
                 eq(ac, one.exportRaw(one.resolve(portable).requireSingle()).getDeclaringClass()); eq(bc, two.exportRaw(two.resolve(portable).requireSingle()).getDeclaringClass());
                 eq(ResolutionStatus.NOT_FOUND_IN_VISIBLE_UNIVERSE, one.resolve(QuerySpec.builder(ac, MemberKind.METHOD).name("echo").parameters(bc).build()).status());
+            }
+        });
+        test("same-name-members-from-two-loaders-use-distinct-binding-slots", () -> {
+            try (URLClassLoader a = isolated(fixtures); URLClassLoader b = isolated(fixtures);
+                 CodeScope scope = CodeScope.open(a, AccessPolicy.PRESERVE_JAVA_ACCESS, 2)) {
+                Class<?> first = Class.forName("fixture.LoaderFixture", false, a), second = Class.forName("fixture.LoaderFixture", false, b);
+                check(first != second && first.getName().equals(second.getName()), "distinct loader identities");
+                ResolutionResult ar = scope.resolve(QuerySpec.builder(first, MemberKind.METHOD).name("value").selection(Selection.ALL).build());
+                ResolutionResult br = scope.resolve(QuerySpec.builder(second, MemberKind.METHOD).name("value").selection(Selection.ALL).build());
+                eq(ResolutionStatus.ALL_MATCHES, ar.status()); eq(ResolutionStatus.ALL_MATCHES, br.status());
+                ResolvedMember at = ar.members().get(0), bt = br.members().get(0);
+                eq(at.descriptor(), bt.descriptor()); check(at.slot() != bt.slot(), "same descriptor does not merge Class identities");
+                eq(first, scope.exportRaw(at).getDeclaringClass()); eq(second, scope.exportRaw(bt).getDeclaringClass());
+                eq(2L, scope.diagnostics().get("bindings"));
+                ResolutionResult overflow = scope.resolve(QuerySpec.builder(first, MemberKind.METHOD).name("echo").selection(Selection.ALL).build());
+                eq(ResolutionStatus.PARTIAL, overflow.status()); eq("binding_capacity", overflow.receipt().reason());
+                eq(first, scope.exportRaw(at).getDeclaringClass()); eq(second, scope.exportRaw(bt).getDeclaringClass());
+                eq(2L, scope.diagnostics().get("bindings"));
+            }
+        });
+        test("loader-shadow-exact-provider-and-structural-use-owner-signature-identity", () -> {
+            try (URLClassLoader parent = isolated(fixtures);
+                 ShadowLoader parentOwner = new ShadowLoader(fixtures.toUri().toURL(), parent, false);
+                 ShadowLoader childOwner = new ShadowLoader(fixtures.toUri().toURL(), parent, true)) {
+                Class<?> parentType = Class.forName("fixture.ShadowParam", false, parent);
+                Class<?> parentDefinedOwner = Class.forName("fixture.ShadowOwner", false, parent);
+                Class<?> parentShadow = Class.forName("fixture.ShadowParam", false, parentOwner);
+                Class<?> childType = Class.forName("fixture.ShadowParam", false, childOwner);
+                Class<?> childDefinedOwner = Class.forName("fixture.ShadowOwner", false, childOwner);
+                check(parentType != parentShadow && parentType != childType && parentShadow != childType, "same binary name has distinct class identities");
+                check(Class.forName("fixture.ShadowOwner", false, parentOwner) == parentDefinedOwner, "owner delegated to parent");
+                check(childDefinedOwner.getClassLoader() == childOwner, "owner defined by child");
+                verifyShadowMembers(parentOwner, parentDefinedOwner, parentType);
+                verifyShadowMembers(childOwner, childDefinedOwner, childType);
             }
         });
         test("lookup-does-not-initialize", () -> {
@@ -242,10 +337,87 @@ public final class CoreContractTest {
         test("provider-dependency-cycle", () -> { Provider a = new Provider("a", ""), b = new Provider("b", ""); a.dependencies = Collections.singletonList("b"); b.dependencies = Collections.singletonList("a"); expect(IllegalArgumentException.class, () -> ProviderRegistry.create(Arrays.asList(a,b))); });
         test("provider-deterministic-install-order", () -> { Provider a = new Provider("a", ""), b = new Provider("b", ""); b.dependencies = Collections.singletonList("a"); try (ProviderRegistry registry = ProviderRegistry.create(Arrays.asList(b,a))) { eq(Arrays.asList("a","b"), registry.installationOrder()); } });
         test("provider-explicit-conflict-owner", () -> { try (ProviderRegistry registry = ProviderRegistry.create(Arrays.asList(new Provider("a","cap"),new Provider("b","cap")), Collections.singletonMap("cap","b"))) { eq(Collections.singletonList("b"), registry.installationOrder()); } });
+        test("provider-registry-checked-close-continues-reverse-order", () -> {
+            IOException original = new IOException("checked cleanup"); List<String> order = new ArrayList<>();
+            Provider a = new Provider("a", ""), b = new Provider("b", ""); a.closeOrder = order; b.closeOrder = order; b.closeFailure = original;
+            ProviderRegistry registry = ProviderRegistry.create(Arrays.asList(a, b));
+            IOException caught = expect(IOException.class, registry::close);
+            check(caught == original, "checked cleanup throwable preserved"); eq(Arrays.asList("b", "a"), order); eq(1, a.closes.get()); eq(1, b.closes.get());
+            registry.close(); eq(1, a.closes.get()); eq(1, b.closes.get());
+        });
+        test("scope-explicit-close-propagates-original-checked-failure", () -> {
+            IOException original = new IOException("checked cleanup"); Provider provider = new Provider("p", ""); provider.closeFailure = original;
+            CodeScope scope = providerScope(provider); IOException caught = expect(IOException.class, scope::close);
+            check(caught == original, "explicit close preserves checked throwable"); eq(IOException.class.getName(), scope.closeFailureType());
+            eq(CodeScope.State.CLOSED, scope.state()); eq(1, provider.closes.get()); scope.close();
+        });
+        test("scope-explicit-close-interruption-preserves-flag", () -> {
+            InterruptedException original = new InterruptedException("checked cleanup"); Provider provider = new Provider("p", ""); provider.closeFailure = original;
+            try {
+                CodeScope scope = providerScope(provider); InterruptedException caught = expect(InterruptedException.class, scope::close);
+                check(caught == original, "explicit close preserves interrupted throwable"); check(Thread.currentThread().isInterrupted(), "close interruption preserved");
+                eq(InterruptedException.class.getName(), scope.closeFailureType()); eq(CodeScope.State.CLOSED, scope.state());
+            } finally { Thread.interrupted(); }
+        });
+        test("provider-close-later-provider-cannot-clear-interrupted-failure", () -> {
+            InterruptedException original = new InterruptedException("first cleanup"); List<String> order = new ArrayList<>();
+            Provider a = new Provider("a", ""), b = new Provider("b", ""); a.closeOrder = order; b.closeOrder = order;
+            a.clearInterruptOnClose = true; b.closeFailure = original;
+            try {
+                ProviderRegistry registry = ProviderRegistry.create(Arrays.asList(a, b));
+                InterruptedException caught = expect(InterruptedException.class, registry::close);
+                check(caught == original, "checked cleanup throwable preserved"); eq(Arrays.asList("b", "a"), order);
+                check(a.closeSawInterrupt.get(), "later provider saw and cleared interrupt");
+                check(Thread.currentThread().isInterrupted(), "later provider cannot erase observed interruption");
+            } finally { Thread.interrupted(); }
+        });
+        test("provider-close-fatal-path-restores-observed-interrupt", () -> {
+            InterruptedException interrupted = new InterruptedException("first cleanup"); SyntheticFatal fatal = new SyntheticFatal();
+            List<String> order = new ArrayList<>(); Provider a = new Provider("a", ""), b = new Provider("b", "");
+            a.closeOrder = order; b.closeOrder = order; a.clearInterruptOnClose = true; a.closeFailure = fatal; b.closeFailure = interrupted;
+            try {
+                ProviderRegistry registry = ProviderRegistry.create(Arrays.asList(a, b));
+                check(expect(SyntheticFatal.class, registry::close) == fatal, "fatal cleanup propagates");
+                eq(Arrays.asList("b", "a"), order); check(a.closeSawInterrupt.get(), "fatal provider cleared observed interruption");
+                check(Thread.currentThread().isInterrupted(), "fatal path preserves observed interruption");
+            } finally { Thread.interrupted(); }
+        });
+        test("scope-explicit-close-does-not-swallow-fatal", () -> {
+            SyntheticFatal original = new SyntheticFatal(); Provider provider = new Provider("p", ""); provider.closeFailure = original;
+            CodeScope scope = providerScope(provider); SyntheticFatal caught = expect(SyntheticFatal.class, scope::close);
+            check(caught == original, "fatal cleanup propagates"); eq(CodeScope.State.CLOSED, scope.state());
+        });
         test("provider-partial-unique-stays-partial", () -> { Provider provider = new Provider("p", ""); provider.complete = false; try (CodeScope scope = providerScope(provider)) { eq(ResolutionStatus.PARTIAL, scope.resolve(providerQuery()).status()); } });
         test("provider-wrong-identity-stale", () -> { Provider provider = new Provider("p", ""); provider.fingerprint = "wrong"; try (CodeScope scope = providerScope(provider)) { eq(ResolutionStatus.STALE, scope.resolve(providerQuery()).status()); } });
         test("provider-runtime-filtered-partial", () -> { Provider provider = new Provider("p", ""); provider.candidates = Arrays.asList(descriptor("zero","I"), descriptor("missing","I")); try (CodeScope scope = providerScope(provider)) { eq(ResolutionStatus.PARTIAL, scope.resolve(providerQuery()).status()); } });
-        test("provider-duplicate-runtime-dedup", () -> { Provider provider = new Provider("p", ""); provider.candidates = Arrays.asList(descriptor("zero","I"),descriptor("zero","I")); try (CodeScope scope = providerScope(provider)) { scope.resolve(providerQuery()).requireSingle(); } });
+        test("provider-duplicate-runtime-dedup", () -> {
+            Provider provider = new Provider("p", ""); provider.candidates = Arrays.asList(descriptor("zero","I"),descriptor("zero","I"));
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 1)) {
+                scope.installProviders(ProviderRegistry.create(Collections.singletonList(provider)), IDENTITY);
+                ResolvedMember unique = scope.resolve(providerQuery()).requireSingle();
+                ResolutionResult all = scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").selection(Selection.ALL).provider("p").build());
+                eq(ResolutionStatus.ALL_MATCHES, all.status()); check(all.receipt().coverage().complete(), "duplicate provider candidates independently verified");
+                eq(1, all.members().size()); eq(Collections.singletonList(descriptor("zero", "I")), all.receipt().descriptors());
+                eq(unique.slot(), all.members().get(0).slot()); eq(1L, scope.diagnostics().get("bindings"));
+            }
+        });
+        test("provider-partial-dedup-preserves-existing-and-new-bindings", () -> {
+            Provider provider = new Provider("p", ""); provider.complete = false;
+            provider.candidates = Arrays.asList(descriptor("zero", "I"), descriptor("zero", "I"), descriptor("one", "I", "I"), descriptor("one", "I", "I"));
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 2)) {
+                scope.installProviders(ProviderRegistry.create(Collections.singletonList(provider)), IDENTITY);
+                ResolvedMember prior = scope.resolve(QuerySpec.exact(descriptor("zero", "I"))).requireSingle();
+                MethodPlan existing = scope.bindMethod(prior);
+                QuerySpec query = QuerySpec.builder(Target.class, MemberKind.METHOD).selection(Selection.ALL).provider("p").build();
+                ResolutionResult partial = scope.resolve(query);
+                eq(ResolutionStatus.PARTIAL, partial.status()); check(!partial.receipt().coverage().complete(), "provider partial remains incomplete");
+                eq(Arrays.asList(descriptor("zero", "I"), descriptor("one", "I", "I")), partial.receipt().descriptors());
+                eq(2, partial.members().size()); eq(prior.slot(), partial.members().get(0).slot()); eq(2L, scope.diagnostics().get("bindings"));
+                eq(0, existing.invoke(new Target(), new Object[0])); eq(3, scope.bindMethod(partial.members().get(1)).invoke(new Target(), new Object[]{3}));
+                ResolutionResult repeated = scope.resolve(query); eq(ResolutionStatus.PARTIAL, repeated.status()); eq(2, provider.discoveries.get());
+                eq(2L, scope.diagnostics().get("bindings")); eq(1L, scope.diagnostics().get("cachedQueries"));
+            }
+        });
         test("provider-candidate-outside-domain", () -> { Provider provider = new Provider("p", ""); provider.candidates = Collections.singletonList(MemberDescriptor.method(String.class.getName(),"length","I")); try (CodeScope scope = providerScope(provider)) { eq(ResolutionStatus.PARTIAL, scope.resolve(providerQuery()).status()); } });
         test("provider-weak-identity-rejected", () -> { try (CodeScope scope = CodeScope.open(LOADER); ProviderRegistry registry = ProviderRegistry.create(Collections.singletonList(new Provider("p","")))) { expect(IllegalArgumentException.class, () -> scope.installProviders(registry, CodeIdentity.unverified("fixture", QuerySpec.RULE_VERSION))); } });
         test("provider-snapshot-owned-and-frozen", () -> { Provider provider = new Provider("p", ""); CodeScope scope = providerScope(provider); scope.resolve(providerQuery()); try (ProviderRegistry registry = ProviderRegistry.create(Collections.singletonList(new Provider("other","")))) { expect(IllegalStateException.class, () -> scope.installProviders(registry, IDENTITY)); } scope.close(); scope.close(); eq(1, provider.closes.get()); });
@@ -266,11 +438,201 @@ public final class CoreContractTest {
             }
         });
         test("provider-complete-claim-does-not-prove-absence", () -> { Provider provider = new Provider("p", ""); provider.candidates = Collections.emptyList(); try (CodeScope scope = providerScope(provider)) { eq(ResolutionStatus.PARTIAL,scope.resolve(providerQuery()).status()); } });
+        test("provider-first-preserves-declared-and-java-public-order", () -> {
+            for (Hierarchy hierarchy : new Hierarchy[]{Hierarchy.DECLARED, Hierarchy.JAVA_PUBLIC}) {
+                Method[] domain = hierarchy == Hierarchy.JAVA_PUBLIC ? Target.class.getMethods() : Target.class.getDeclaredMethods();
+                List<MemberDescriptor> reversed = new ArrayList<>();
+                for (Method method : domain) if (method.getName().equals("pick")) reversed.add(MemberDescriptor.from(method));
+                eq(2, reversed.size()); Collections.reverse(reversed);
+                Provider provider = new Provider("p", ""); provider.candidates = reversed;
+                try (CodeScope scope = providerScope(provider)) {
+                    QuerySpec direct = QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").hierarchy(hierarchy).selection(Selection.FIRST).build();
+                    QuerySpec supplied = QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").hierarchy(hierarchy).selection(Selection.FIRST).provider("p").build();
+                    ResolutionResult expected = scope.resolve(direct), actual = scope.resolve(supplied);
+                    eq(ResolutionStatus.RESOLVED, expected.status()); eq(ResolutionStatus.RESOLVED, actual.status());
+                    Method first = (Method) scope.exportRaw(expected.requireSingle()), provided = (Method) scope.exportRaw(actual.requireSingle());
+                    Method other = Arrays.stream(domain).filter(method -> MemberDescriptor.from(method).equals(reversed.get(0))).findFirst().orElseThrow();
+                    check(!Objects.equals(first.invoke(new Target(), new Object[]{null}), other.invoke(new Target(), new Object[]{null})), "fixture candidates produce different values");
+                    check(!reversed.get(0).equals(MemberDescriptor.from(first)), "fixture reverses actual first");
+                    eq(first, provided); eq(first.invoke(new Target(), new Object[]{null}), provided.invoke(new Target(), new Object[]{null}));
+                }
+            }
+        });
+        test("provider-first-superclasses-preserves-shadowing-order", () -> {
+            Field child = Child.class.getDeclaredField("shadow"), parent = Parent.class.getDeclaredField("shadow");
+            Provider provider = new Provider("p", ""); provider.candidates = Arrays.asList(MemberDescriptor.from(parent), MemberDescriptor.from(child));
+            try (CodeScope scope = providerScope(provider)) {
+                QuerySpec direct = QuerySpec.builder(Child.class, MemberKind.FIELD).name("shadow").hierarchy(Hierarchy.SUPERCLASSES).selection(Selection.FIRST).build();
+                QuerySpec supplied = QuerySpec.builder(Child.class, MemberKind.FIELD).name("shadow").hierarchy(Hierarchy.SUPERCLASSES).selection(Selection.FIRST).provider("p").build();
+                ResolutionResult expected = scope.resolve(direct), actual = scope.resolve(supplied);
+                eq(ResolutionStatus.RESOLVED, expected.status()); eq(ResolutionStatus.RESOLVED, actual.status());
+                Field first = (Field) scope.exportRaw(expected.requireSingle()), provided = (Field) scope.exportRaw(actual.requireSingle());
+                Child target = new Child(); target.shadow = "child"; ((Parent) target).shadow = 17;
+                check(!Objects.equals(child.get(target), parent.get(target)), "hidden fields have different values");
+                eq(child, first); eq(first, provided); eq(first.get(target), provided.get(target));
+            }
+        });
+        test("provider-first-incomplete-does-not-claim-success", () -> {
+            List<MemberDescriptor> reversed = new ArrayList<>();
+            for (Method method : Target.class.getDeclaredMethods()) if (method.getName().equals("pick")) reversed.add(MemberDescriptor.from(method));
+            eq(2, reversed.size()); Collections.reverse(reversed);
+            for (boolean providerClaimsComplete : new boolean[]{false, true}) {
+                Provider provider = new Provider("p", ""); provider.candidates = Collections.singletonList(reversed.get(0)); provider.complete = providerClaimsComplete;
+                try (CodeScope scope = providerScope(provider)) {
+                    ResolutionResult result = scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").selection(Selection.FIRST).provider("p").build());
+                    eq(ResolutionStatus.PARTIAL, result.status()); check(!result.receipt().coverage().complete(), "incomplete set cannot prove first");
+                }
+            }
+        });
         test("provider-java-public-rejects-private", () -> {
             Provider provider = new Provider("p", ""); provider.candidates = Collections.singletonList(descriptor("privateValue","I"));
             try (CodeScope scope = providerScope(provider)) { eq(ResolutionStatus.PARTIAL,scope.resolve(QuerySpec.builder(Target.class,MemberKind.METHOD).name("privateValue").hierarchy(Hierarchy.JAVA_PUBLIC).provider("p").build()).status()); }
         });
         test("provider-explicit-cancellation-is-distinct", () -> { Provider provider = new Provider("p", ""); provider.cancel=true; try (CodeScope scope=providerScope(provider)) { eq(ResolutionStatus.CANCELLED,scope.resolve(providerQuery()).status()); eq(0L,scope.diagnostics().get("cachedQueries")); } });
+        test("provider-empty-result-interrupted-is-not-complete-absence", () -> {
+            eq(0, EmptyTarget.class.getDeclaredMethods().length);
+            for (Class<?> owner : new Class<?>[]{EmptyTarget.class, Target.class}) {
+                Provider provider = new Provider("p", ""); provider.candidates = Collections.emptyList(); provider.interruptBeforeReturn = true;
+                try (CodeScope scope = providerScope(provider)) {
+                    QuerySpec query = QuerySpec.builder(owner, MemberKind.METHOD).name("missing").selection(Selection.ALL).provider("p").build();
+                    ResolutionResult result = scope.resolve(query);
+                    eq(ResolutionStatus.CANCELLED, result.status()); check(!result.receipt().coverage().complete(), "interrupted result is incomplete");
+                    check(Thread.currentThread().isInterrupted(), "provider interrupt preserved"); eq(0L, scope.diagnostics().get("cachedQueries"));
+                    eq(1, provider.discoveries.get());
+                } finally { Thread.interrupted(); }
+            }
+        });
+        test("provider-empty-result-without-interruption-is-complete-absence", () -> {
+            eq(0, EmptyTarget.class.getDeclaredMethods().length);
+            for (Class<?> owner : new Class<?>[]{EmptyTarget.class, Target.class}) {
+                Provider provider = new Provider("p", ""); provider.candidates = Collections.emptyList();
+                try (CodeScope scope = providerScope(provider)) {
+                    QuerySpec query = QuerySpec.builder(owner, MemberKind.METHOD).name("missing").selection(Selection.ALL).provider("p").build();
+                    ResolutionResult result = scope.resolve(query);
+                    eq(ResolutionStatus.NOT_FOUND_IN_VISIBLE_UNIVERSE, result.status()); check(result.receipt().coverage().complete(), "complete empty domain");
+                    check(!Thread.currentThread().isInterrupted(), "thread not interrupted"); eq(0L, scope.diagnostics().get("cachedQueries"));
+                }
+            }
+        });
+        test("provider-interruption-with-full-binding-capacity-stays-cancelled", () -> {
+            Provider provider = new Provider("p", ""); provider.interruptFlagDescriptorAfterDiscovery = true;
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 1)) {
+                scope.installProviders(ProviderRegistry.create(Collections.singletonList(provider)), IDENTITY);
+                MethodPlan existing = scope.bindMethod(scope.resolve(QuerySpec.exact(descriptor("one", "I", "I"))).requireSingle());
+                eq(1L, scope.diagnostics().get("bindings"));
+                ResolutionResult result = scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").selection(Selection.ALL).provider("p").build());
+                eq(ResolutionStatus.CANCELLED, result.status()); eq("interrupted", result.receipt().reason());
+                eq(ResolutionReceipt.InterruptionOrigin.UNKNOWN, result.receipt().interruptionOrigin());
+                check(!result.receipt().coverage().complete(), "cancelled coverage incomplete"); check(Thread.currentThread().isInterrupted(), "interrupt preserved");
+                check(result.members().isEmpty() && result.receipt().descriptors().isEmpty(), "capacity failure exposes no unbound members");
+                eq(1L, scope.diagnostics().get("bindings")); eq(3, existing.invoke(new Target(), new Object[]{3}));
+                check(Thread.currentThread().isInterrupted(), "existing plan preserves interrupt");
+            } finally { Thread.interrupted(); }
+        });
+        test("provider-interruption-with-available-capacity-retains-partial-members", () -> {
+            Provider provider = new Provider("p", ""); provider.interruptFlagDescriptorAfterDiscovery = true;
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 2)) {
+                scope.installProviders(ProviderRegistry.create(Collections.singletonList(provider)), IDENTITY);
+                MethodPlan existing = scope.bindMethod(scope.resolve(QuerySpec.exact(descriptor("one", "I", "I"))).requireSingle());
+                ResolutionResult result = scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").selection(Selection.ALL).provider("p").build());
+                eq(ResolutionStatus.CANCELLED, result.status()); eq("interrupted", result.receipt().reason());
+                eq(ResolutionReceipt.InterruptionOrigin.UNKNOWN, result.receipt().interruptionOrigin());
+                check(!result.receipt().coverage().complete(), "cancelled coverage incomplete"); check(Thread.currentThread().isInterrupted(), "interrupt preserved");
+                eq(1, result.members().size()); eq(descriptor("zero", "I"), result.members().get(0).descriptor());
+                eq(Collections.singletonList(descriptor("zero", "I")), result.receipt().descriptors());
+                eq(Target.class.getDeclaredMethod("zero"), scope.exportRaw(result.members().get(0)));
+                eq(2L, scope.diagnostics().get("bindings")); eq(3, existing.invoke(new Target(), new Object[]{3}));
+            } finally { Thread.interrupted(); }
+        });
+        test("provider-noninterrupted-binding-capacity-remains-partial", () -> {
+            Provider provider = new Provider("p", "");
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 1)) {
+                scope.installProviders(ProviderRegistry.create(Collections.singletonList(provider)), IDENTITY);
+                MethodPlan existing = scope.bindMethod(scope.resolve(QuerySpec.exact(descriptor("one", "I", "I"))).requireSingle());
+                ResolutionResult result = scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").selection(Selection.ALL).provider("p").build());
+                eq(ResolutionStatus.PARTIAL, result.status()); eq("binding_capacity", result.receipt().reason());
+                eq(1L, scope.diagnostics().get("bindings")); eq(3, existing.invoke(new Target(), new Object[]{3}));
+                check(!Thread.currentThread().isInterrupted(), "noninterrupted query");
+            }
+        });
+    }
+    private static void providerArityContracts() {
+        String owner = ArityFixture.class.getName();
+        MemberDescriptor methodInt = MemberDescriptor.method(owner, "choose", "V", "I");
+        MemberDescriptor methodString = MemberDescriptor.method(owner, "choose", "V", "Ljava/lang/String;");
+        List<MemberDescriptor> methods = Arrays.asList(MemberDescriptor.method(owner, "choose", "V"), methodInt,
+                methodString, MemberDescriptor.method(owner, "choose", "V", "I", "I"));
+        MemberDescriptor constructorInt = MemberDescriptor.constructor(owner, "I");
+        MemberDescriptor constructorString = MemberDescriptor.constructor(owner, "Ljava/lang/String;");
+        List<MemberDescriptor> constructors = Arrays.asList(MemberDescriptor.constructor(owner), constructorInt,
+                constructorString, MemberDescriptor.constructor(owner, "I", "I"));
+        List<MemberDescriptor> fields = Arrays.asList(MemberDescriptor.field(owner, "first", "I"),
+                MemberDescriptor.field(owner, "second", "Ljava/lang/String;"));
+        test("provider-coverage-mixed-arity-methods", () -> {
+            Provider provider = new Provider("p", ""); provider.candidates = methods;
+            try (CodeScope scope = providerScope(provider)) {
+                ResolutionResult result = scope.resolve(QuerySpec.builder(ArityFixture.class, MemberKind.METHOD)
+                        .name("choose").parameterCount(1).selection(Selection.ALL).provider("p").build());
+                eq(ResolutionStatus.ALL_MATCHES, result.status());
+                check(result.receipt().coverage().complete(), "method domain independently verified");
+                eq(new HashSet<>(Arrays.asList(methodInt, methodString)), new HashSet<>(result.receipt().descriptors()));
+                eq(4, result.receipt().coverage().inspected());
+            }
+        });
+        test("provider-coverage-mixed-arity-constructors", () -> {
+            Provider provider = new Provider("p", ""); provider.candidates = constructors;
+            try (CodeScope scope = providerScope(provider)) {
+                ResolutionResult result = scope.resolve(QuerySpec.builder(ArityFixture.class, MemberKind.CONSTRUCTOR)
+                        .parameterCount(1).selection(Selection.ALL).provider("p").build());
+                eq(ResolutionStatus.ALL_MATCHES, result.status());
+                check(result.receipt().coverage().complete(), "constructor domain independently verified");
+                eq(new HashSet<>(Arrays.asList(constructorInt, constructorString)), new HashSet<>(result.receipt().descriptors()));
+                eq(4, result.receipt().coverage().inspected());
+            }
+        });
+        test("provider-coverage-field-arity-zero-and-nonzero", () -> {
+            Provider provider = new Provider("p", ""); provider.candidates = fields;
+            try (CodeScope scope = providerScope(provider)) {
+                ResolutionResult zero = scope.resolve(QuerySpec.builder(ArityFixture.class, MemberKind.FIELD)
+                        .parameterCount(0).selection(Selection.ALL).provider("p").build());
+                eq(ResolutionStatus.ALL_MATCHES, zero.status()); check(zero.receipt().coverage().complete(), "zero-arity fields complete");
+                eq(new HashSet<>(fields), new HashSet<>(zero.receipt().descriptors()));
+                ResolutionResult one = scope.resolve(QuerySpec.builder(ArityFixture.class, MemberKind.FIELD)
+                        .parameterCount(1).selection(Selection.ALL).provider("p").build());
+                eq(ResolutionStatus.NOT_FOUND_IN_VISIBLE_UNIVERSE, one.status());
+                check(one.receipt().coverage().complete(), "nonzero-arity fields empty and complete");
+                check(one.members().isEmpty(), "no field has parameters");
+            }
+        });
+        test("provider-coverage-arity-missing-candidate-is-partial", () -> {
+            Provider provider = new Provider("p", ""); provider.candidates = Collections.singletonList(methodInt);
+            try (CodeScope scope = providerScope(provider)) {
+                ResolutionResult result = scope.resolve(QuerySpec.builder(ArityFixture.class, MemberKind.METHOD)
+                        .name("choose").parameterCount(1).selection(Selection.ALL).provider("p").build());
+                eq(ResolutionStatus.PARTIAL, result.status());
+                check(!result.receipt().coverage().complete(), "missing same-arity overload cannot prove completeness");
+                eq("provider_coverage_not_proven", result.receipt().reason());
+            }
+        });
+        test("provider-coverage-arity-verifier-budget-is-partial", () -> {
+            Provider provider = new Provider("p", ""); provider.candidates = Arrays.asList(methodInt, methodString);
+            try (CodeScope scope = providerScope(provider)) {
+                ResolutionResult result = scope.resolve(QuerySpec.builder(ArityFixture.class, MemberKind.METHOD)
+                        .name("choose").parameterCount(1).selection(Selection.ALL).candidateBudget(2).provider("p").build());
+                eq(ResolutionStatus.PARTIAL, result.status());
+                check(!result.receipt().coverage().complete(), "verifier budget cannot prove completeness");
+                eq("provider_coverage_not_proven", result.receipt().reason());
+            }
+        });
+        test("provider-coverage-arity-provider-partial-stays-partial", () -> {
+            Provider provider = new Provider("p", ""); provider.candidates = methods; provider.complete = false;
+            try (CodeScope scope = providerScope(provider)) {
+                ResolutionResult result = scope.resolve(QuerySpec.builder(ArityFixture.class, MemberKind.METHOD)
+                        .name("choose").parameterCount(1).selection(Selection.ALL).provider("p").build());
+                eq(ResolutionStatus.PARTIAL, result.status());
+                check(!result.receipt().coverage().complete(), "provider partial is never upgraded");
+            }
+        });
     }
     private static void concurrencyContracts() {
         test("close-in-flight-target-nonblocking", () -> {
@@ -283,6 +645,91 @@ public final class CoreContractTest {
             } finally { target.exit.countDown(); scope.close(); executor.shutdownNow(); }
         });
         test("interrupted-query-preserves-flag", () -> { try (CodeScope scope = CodeScope.open(LOADER)) { Thread.currentThread().interrupt(); eq(ResolutionStatus.CANCELLED, scope.resolve(QuerySpec.exact(descriptor("zero","I"))).status()); check(Thread.currentThread().isInterrupted(), "interrupt preserved"); } finally { Thread.interrupted(); } });
+        test("receipt-legacy-constructor-interruption-origin-unknown", () -> {
+            ResolutionReceipt receipt = new ResolutionReceipt("fixture", Selection.UNIQUE, ResolutionStatus.CANCELLED,
+                    new Coverage("fixture", false, 0, "wait_interrupted"), Collections.emptyList(), "wait_interrupted", null);
+            eq(ResolutionReceipt.InterruptionOrigin.UNKNOWN, receipt.interruptionOrigin());
+        });
+        test("owner-descriptor-sneaky-interrupt-is-not-waiter", () -> {
+            Provider provider = new Provider("p", ""); provider.interruptDescriptorAfterDiscovery = true;
+            try (CodeScope scope = providerScope(provider)) {
+                ResolutionResult result = scope.resolve(providerQuery());
+                eq(1, provider.discoveries.get()); eq(ResolutionStatus.CANCELLED, result.status());
+                eq("wait_interrupted", result.receipt().reason()); eq(null, result.receipt().causeType());
+                eq(ResolutionReceipt.InterruptionOrigin.UNKNOWN, result.receipt().interruptionOrigin());
+                check(Thread.currentThread().isInterrupted(), "owner interrupt preserved");
+            } finally { Thread.interrupted(); }
+        });
+        test("scope-waiter-interrupt-is-isolated-and-classified", () -> {
+            Provider provider = new Provider("p", ""); provider.entered = new CountDownLatch(1); provider.exit = new CountDownLatch(1);
+            ExecutorService executor = Executors.newSingleThreadExecutor(); AtomicReference<ResolutionResult> waiterResult = new AtomicReference<>();
+            AtomicBoolean waiterFlag = new AtomicBoolean(); AtomicReference<Throwable> waiterFailure = new AtomicReference<>();
+            try (CodeScope scope = providerScope(provider)) {
+                Future<ResolutionResult> owner = executor.submit(() -> scope.resolve(providerQuery())); await(provider.entered);
+                Thread waiter = new Thread(() -> { try { waiterResult.set(scope.resolve(providerQuery())); waiterFlag.set(Thread.currentThread().isInterrupted()); } catch (Throwable failure) { waiterFailure.set(failure); } });
+                waiter.start(); awaitScopeWaiter(scope, waiter); waiter.interrupt(); waiter.join(2000);
+                check(!waiter.isAlive(), "waiter finished"); eq(null, waiterFailure.get());
+                ResolutionResult result = waiterResult.get(); eq(ResolutionStatus.CANCELLED, result.status()); eq("wait_interrupted", result.receipt().reason());
+                eq(ResolutionReceipt.InterruptionOrigin.SINGLE_FLIGHT_WAITER, result.receipt().interruptionOrigin()); check(waiterFlag.get(), "waiter interrupt preserved");
+                check(!owner.isDone(), "waiter did not cancel owner"); provider.exit.countDown(); owner.get(3, TimeUnit.SECONDS).requireSingle(); eq(1, provider.discoveries.get());
+            } finally { provider.exit.countDown(); executor.shutdownNow(); }
+        });
+        test("shared-owner-descriptor-sneaky-interrupt-preserves-waiter-failure", () -> {
+            Provider provider = new Provider("p", ""); provider.entered = new CountDownLatch(1); provider.exit = new CountDownLatch(1); provider.interruptDescriptorAfterDiscovery = true;
+            ExecutorService executor = Executors.newSingleThreadExecutor(); AtomicBoolean ownerFlag = new AtomicBoolean(), waiterFlag = new AtomicBoolean();
+            AtomicReference<Throwable> waiterFailure = new AtomicReference<>();
+            try (CodeScope scope = providerScope(provider)) {
+                Future<ResolutionResult> owner = executor.submit(() -> { ResolutionResult result = scope.resolve(providerQuery()); ownerFlag.set(Thread.currentThread().isInterrupted()); return result; }); await(provider.entered);
+                Thread waiter = new Thread(() -> { try { scope.resolve(providerQuery()); waiterFailure.set(new AssertionError("expected owner failure")); } catch (Throwable failure) { waiterFailure.set(failure); } finally { waiterFlag.set(Thread.currentThread().isInterrupted()); } });
+                waiter.start(); awaitScopeWaiter(scope, waiter); provider.exit.countDown();
+                ResolutionResult result = owner.get(3, TimeUnit.SECONDS); waiter.join(2000); check(!waiter.isAlive(), "waiter finished");
+                eq(ResolutionStatus.CANCELLED, result.status()); eq("wait_interrupted", result.receipt().reason());
+                eq(ResolutionReceipt.InterruptionOrigin.UNKNOWN, result.receipt().interruptionOrigin()); check(ownerFlag.get(), "owner interrupt preserved");
+                check(waiterFailure.get() instanceof IllegalStateException, "waiter sees owner failure");
+                check(waiterFailure.get().getCause() instanceof InterruptedException, "waiter sees original owner failure as cause");
+                check(!waiterFlag.get(), "waiter was not interrupted"); eq(1, provider.discoveries.get());
+            } finally { provider.exit.countDown(); executor.shutdownNow(); }
+        });
+        test("shared-provider-interruption-is-not-waiter-interruption", () -> {
+            Provider provider = new Provider("p", ""); provider.entered = new CountDownLatch(1); provider.exit = new CountDownLatch(1); provider.interruptAfterWait = true;
+            ExecutorService executor = Executors.newSingleThreadExecutor(); AtomicBoolean ownerFlag = new AtomicBoolean(), waiterFlag = new AtomicBoolean();
+            AtomicReference<ResolutionResult> waiterResult = new AtomicReference<>(); AtomicReference<Throwable> waiterFailure = new AtomicReference<>();
+            try (CodeScope scope = providerScope(provider)) {
+                Future<ResolutionResult> owner = executor.submit(() -> { ResolutionResult result = scope.resolve(providerQuery()); ownerFlag.set(Thread.currentThread().isInterrupted()); return result; }); await(provider.entered);
+                Thread waiter = new Thread(() -> { try { waiterResult.set(scope.resolve(providerQuery())); waiterFlag.set(Thread.currentThread().isInterrupted()); } catch (Throwable failure) { waiterFailure.set(failure); } });
+                waiter.start(); awaitScopeWaiter(scope, waiter); provider.exit.countDown();
+                ResolutionResult ownerResult = owner.get(3, TimeUnit.SECONDS); waiter.join(2000); check(!waiter.isAlive(), "waiter finished"); eq(null, waiterFailure.get());
+                ResolutionResult shared = waiterResult.get(); check(ownerResult == shared, "shared owner result");
+                eq(ResolutionStatus.CANCELLED, shared.status()); eq("provider_interrupted", shared.receipt().reason()); eq(InterruptedException.class.getName(), shared.receipt().causeType());
+                eq(ResolutionReceipt.InterruptionOrigin.UNKNOWN, shared.receipt().interruptionOrigin()); check(ownerFlag.get(), "owner interrupt preserved"); check(!waiterFlag.get(), "waiter was not interrupted"); eq(1, provider.discoveries.get());
+            } finally { provider.exit.countDown(); executor.shutdownNow(); }
+        });
+        test("last-release-provider-close-preserves-query-interruption", () -> {
+            Provider provider = new Provider("p", ""); provider.entered = new CountDownLatch(1); provider.exit = new CountDownLatch(1);
+            provider.interruptAfterWait = true; provider.clearInterruptOnClose = true;
+            CodeScope scope = providerScope(provider); AtomicReference<ResolutionResult> result = new AtomicReference<>();
+            AtomicReference<Throwable> failure = new AtomicReference<>(); AtomicBoolean callerFlag = new AtomicBoolean();
+            Thread owner = new Thread(() -> { try { result.set(scope.resolve(providerQuery())); callerFlag.set(Thread.currentThread().isInterrupted()); } catch (Throwable error) { failure.set(error); } });
+            try {
+                owner.start(); await(provider.entered);
+                Field field = CodeScope.class.getDeclaredField("coordinator"); field.setAccessible(true); Object coordinator = field.get(scope);
+                synchronized (coordinator) {
+                    provider.exit.countDown(); long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2); boolean blocked = false;
+                    while (System.nanoTime() < deadline) {
+                        if (owner.getState() == Thread.State.BLOCKED) {
+                            for (StackTraceElement frame : owner.getStackTrace()) if (frame.getClassName().equals(QueryCoordinator.class.getName()) && frame.getMethodName().equals("execute")) blocked = true;
+                        }
+                        if (blocked) break; Thread.yield();
+                    }
+                    check(blocked, "owner completed query and is blocked removing flight"); eq(0, provider.closes.get());
+                    scope.close(); eq(CodeScope.State.RETIRING, scope.state());
+                }
+                owner.join(3000); check(!owner.isAlive(), "owner finished"); eq(null, failure.get());
+                eq(ResolutionStatus.CANCELLED, result.get().status()); eq("provider_interrupted", result.get().receipt().reason());
+                check(provider.closeSawInterrupt.get(), "provider observed and cleared interrupt");
+                check(callerFlag.get(), "last release preserved caller interrupt"); eq(1, provider.closes.get()); eq(CodeScope.State.CLOSED, scope.state());
+            } finally { provider.exit.countDown(); owner.interrupt(); owner.join(3000); scope.close(); }
+        });
         test("single-flight-shared-miss", () -> {
             Provider provider = new Provider("p", ""); provider.entered = new CountDownLatch(1); provider.exit = new CountDownLatch(1);
             ExecutorService executor = Executors.newFixedThreadPool(4);
@@ -340,6 +787,23 @@ public final class CoreContractTest {
             InvocationTargetException failure = expect(InvocationTargetException.class, () -> plan.invoke(target,new Object[0]));
             eq("original target",failure.getCause().getMessage()); eq(IllegalStateException.class.getName(),scope.closeFailureType()); eq(CodeScope.State.CLOSED,scope.state());
         });
+        test("provider-checked-close-failure-preserves-target-exception", () -> {
+            IOException original = new IOException("checked cleanup"); List<String> order = new ArrayList<>();
+            Provider a = new Provider("a", ""), b = new Provider("b", ""); a.closeOrder = order; b.closeOrder = order; b.closeFailure = original;
+            CodeScope scope = CodeScope.open(LOADER); scope.installProviders(ProviderRegistry.create(Arrays.asList(a, b)), IDENTITY);
+            ClosingTarget target = new ClosingTarget(scope);
+            MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(ClosingTarget.class.getName(),"run","V"))).requireSingle());
+            InvocationTargetException failure = expect(InvocationTargetException.class, () -> plan.invoke(target, new Object[0]));
+            check(failure.getCause() instanceof IllegalArgumentException, "original target cause"); eq("original target", failure.getCause().getMessage());
+            eq(Arrays.asList("b", "a"), order); eq(IOException.class.getName(), scope.closeFailureType()); eq(CodeScope.State.CLOSED, scope.state());
+        });
+        test("provider-fatal-close-during-target-is-not-swallowed", () -> {
+            SyntheticFatal original = new SyntheticFatal(); Provider provider = new Provider("p", ""); provider.closeFailure = original;
+            CodeScope scope = providerScope(provider); ClosingTarget target = new ClosingTarget(scope);
+            MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(ClosingTarget.class.getName(),"run","V"))).requireSingle());
+            SyntheticFatal caught = expect(SyntheticFatal.class, () -> plan.invoke(target, new Object[0]));
+            check(caught == original, "fatal cleanup propagates during target invocation"); eq(1, provider.closes.get()); eq(CodeScope.State.CLOSED, scope.state());
+        });
     }
     private static int cycle(QueryCoordinator<String,Integer> coordinator, String dependency, CyclicBarrier barrier) {
         try { barrier.await(2,TimeUnit.SECONDS); return coordinator.execute(dependency, () -> 0,1000); } catch (InterruptedException | TimeoutException | BrokenBarrierException e) { throw new AssertionError(e); }
@@ -347,15 +811,47 @@ public final class CoreContractTest {
     private static QuerySpec providerQuery() { return QuerySpec.builder(Target.class,MemberKind.METHOD).name("zero").provider("p").build(); }
     private static CodeScope providerScope(Provider provider) { CodeScope scope = CodeScope.open(LOADER); scope.installProviders(ProviderRegistry.create(Collections.singletonList(provider)), IDENTITY); return scope; }
     private static MemberDescriptor descriptor(String name, String returns, String... parameters) { return MemberDescriptor.method(Target.class.getName(), name, returns, parameters); }
+    private static void verifyShadowMembers(ClassLoader loader, Class<?> owner, Class<?> signatureType) throws Exception {
+        Class<?> arrayType = java.lang.reflect.Array.newInstance(signatureType, 0).getClass();
+        List<Member> expected = Arrays.asList(owner.getDeclaredMethod("method", signatureType), owner.getDeclaredMethod("returns"),
+                owner.getDeclaredMethod("arrayMethod", arrayType), owner.getDeclaredMethod("returnsArray"),
+                owner.getDeclaredField("field"), owner.getDeclaredField("arrayField"),
+                owner.getDeclaredConstructor(signatureType), owner.getDeclaredConstructor(arrayType));
+        for (Member member : expected) {
+            MemberDescriptor descriptor = MemberDescriptor.from(member); Provider provider = new Provider("p", ""); provider.candidates = Collections.singletonList(descriptor);
+            try (CodeScope scope = CodeScope.open(loader)) {
+                scope.installProviders(ProviderRegistry.create(Collections.singletonList(provider)), IDENTITY);
+                ResolutionResult direct = scope.resolve(shadowQuery(owner, member, false));
+                eq(ResolutionStatus.ALL_MATCHES, direct.status()); check(direct.receipt().coverage().complete(), "structural coverage");
+                eq(1, direct.members().size()); eq(member, scope.exportRaw(direct.members().get(0)));
+                ResolutionResult exact = scope.resolve(QuerySpec.exact(descriptor));
+                eq(ResolutionStatus.RESOLVED, exact.status()); eq(member, scope.exportRaw(exact.requireSingle()));
+                ResolutionResult supplied = scope.resolve(shadowQuery(owner, member, true));
+                eq(ResolutionStatus.ALL_MATCHES, supplied.status()); check(supplied.receipt().coverage().complete(), "provider coverage");
+                eq(1, supplied.members().size()); eq(member, scope.exportRaw(supplied.members().get(0)));
+            }
+        }
+    }
+    private static QuerySpec shadowQuery(Class<?> owner, Member member, boolean provider) {
+        MemberKind kind = member instanceof Method ? MemberKind.METHOD : member instanceof Field ? MemberKind.FIELD : MemberKind.CONSTRUCTOR;
+        QuerySpec.Builder builder = QuerySpec.builder(owner, kind).selection(Selection.ALL);
+        if (member instanceof Method) {
+            Method method = (Method) member; builder.name(method.getName()).parameters(method.getParameterTypes()).returns(method.getReturnType());
+        } else if (member instanceof Field) {
+            Field field = (Field) member; builder.name(field.getName()).returns(field.getType());
+        } else builder.parameters(((Constructor<?>) member).getParameterTypes());
+        if (provider) builder.provider("p");
+        return builder.build();
+    }
     private static void prepareFixtures() throws IOException {
         Path root = Path.of("").toAbsolutePath(); while (!Files.isDirectory(root.resolve("test-fixtures/isolated-src"))) { root = root.getParent(); if (root == null) throw new IOException("test-fixtures not found"); }
         fixtures = Files.createDirectories(root.resolve("ref-core/build/isolated-fixtures/all")); missing = Files.createDirectories(root.resolve("ref-core/build/isolated-fixtures/missing/fixture")).getParent();
         Path sources = root.resolve("test-fixtures/isolated-src/fixture");
-        int result = ToolProvider.getSystemJavaCompiler().run(null,System.out,System.err,"--release","17","-d",fixtures.toString(),sources.resolve("LoaderFixture.java").toString(),sources.resolve("MissingType.java").toString(),sources.resolve("MissingSignatureFixture.java").toString());
+        int result = ToolProvider.getSystemJavaCompiler().run(null,System.out,System.err,"--release","17","-d",fixtures.toString(),sources.resolve("LoaderFixture.java").toString(),sources.resolve("MissingType.java").toString(),sources.resolve("MissingSignatureFixture.java").toString(),sources.resolve("ShadowParam.java").toString(),sources.resolve("ShadowOwner.java").toString());
         if (result != 0) throw new IOException("fixture compilation failed: " + result);
         Files.copy(fixtures.resolve("fixture/MissingSignatureFixture.class"), missing.resolve("fixture/MissingSignatureFixture.class"), StandardCopyOption.REPLACE_EXISTING);
         Path completeJar = root.resolve("ref-core/build/isolated-fixtures/complete-fixture.jar");
-        fixtureJar(completeJar, fixtures, "fixture/LoaderFixture.class", "fixture/MissingType.class", "fixture/MissingSignatureFixture.class");
+        fixtureJar(completeJar, fixtures, "fixture/LoaderFixture.class", "fixture/MissingType.class", "fixture/MissingSignatureFixture.class", "fixture/ShadowParam.class", "fixture/ShadowOwner.class");
         Path missingJar = root.resolve("ref-core/build/isolated-fixtures/missing-signature-fixture.jar");
         fixtureJar(missingJar, missing, "fixture/MissingSignatureFixture.class");
         fixtures = completeJar; missing = missingJar;
@@ -366,6 +862,17 @@ public final class CoreContractTest {
         }
     }
     private static URLClassLoader isolated(Path directory) throws MalformedURLException { return new URLClassLoader(new URL[]{directory.toUri().toURL()}, null); }
+    private static final class ShadowLoader extends URLClassLoader {
+        private final boolean childOwner;
+        ShadowLoader(URL location, ClassLoader parent, boolean childOwner) { super(new URL[]{location}, parent); this.childOwner = childOwner; }
+        @Override protected synchronized Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            if (name.equals("fixture.ShadowParam") || (childOwner && name.equals("fixture.ShadowOwner"))) {
+                Class<?> type = findLoadedClass(name); if (type == null) type = findClass(name);
+                if (resolve) resolveClass(type); return type;
+            }
+            return super.loadClass(name, resolve);
+        }
+    }
     private static Object[] closedPlan() throws Exception {
         URLClassLoader loader = isolated(fixtures); WeakReference<ClassLoader> weak = new WeakReference<>(loader); CodeScope scope = CodeScope.open(loader);
         MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method("fixture.LoaderFixture","value","Ljava/lang/String;"))).requireSingle()); scope.close(); loader.close(); return new Object[]{weak,plan};
@@ -393,6 +900,12 @@ public final class CoreContractTest {
     private static void eq(Object expected, Object actual) { if (!Objects.equals(expected, actual)) throw new AssertionError("expected="+expected+" actual="+actual); }
     private static <T extends Throwable> T expect(Class<T> type, Checked action) throws Exception { try { action.run(); } catch (Throwable failure) { if (type.isInstance(failure)) return type.cast(failure); throw new AssertionError("expected "+type+", got "+failure, failure); } throw new AssertionError("expected "+type.getName()); }
     private static void await(CountDownLatch latch) throws InterruptedException { check(latch.await(3,TimeUnit.SECONDS), "latch timeout"); }
+    private static void awaitScopeWaiter(CodeScope scope, Thread waiter) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (System.nanoTime() < deadline && (scope.diagnostics().get("inFlight") < 2 || waiter.getState() != Thread.State.TIMED_WAITING)) Thread.yield();
+        check(scope.diagnostics().get("inFlight") == 2 && waiter.getState() == Thread.State.TIMED_WAITING, "waiter entered single-flight wait");
+    }
+    @SuppressWarnings("unchecked") private static <T extends Throwable> void sneakyThrow(Throwable failure) throws T { throw (T) failure; }
     private static void blockingAwait(CountDownLatch latch) { try { await(latch); } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); } }
     private interface Checked { void run() throws Exception; }
     public static class Target {
@@ -411,16 +924,31 @@ public final class CoreContractTest {
         public void throwOnce() { calls++; throw new IllegalStateException("target"); }
         private int privateValue() { return 42; }
     }
+    public static final class EmptyTarget { }
     public static class Parent { public int shadow; public Object covariant() { return "parent"; } }
     public static final class Child extends Parent { public String shadow; @Override public String covariant() { return "child"; } }
     public static final class Blocking { final CountDownLatch entered = new CountDownLatch(1), exit = new CountDownLatch(1); public int run() { entered.countDown(); blockingAwait(exit); return 1; } }
     public static final class ClosingTarget { private final CodeScope scope; ClosingTarget(CodeScope scope) { this.scope=scope; } public void run() { scope.close(); throw new IllegalArgumentException("original target"); } }
+    private static final class SyntheticFatal extends VirtualMachineError { }
+    public static final class ArityFixture {
+        public int first;
+        public String second;
+        public ArityFixture() { }
+        public ArityFixture(int value) { }
+        public ArityFixture(String value) { }
+        public ArityFixture(int first, int second) { }
+        public void choose() { }
+        public void choose(int value) { }
+        public void choose(String value) { }
+        public void choose(int first, int second) { }
+    }
     private static final class Provider implements CandidateProvider {
         final String id, capability; int major=1; List<String> dependencies=Collections.emptyList(); List<MemberDescriptor> candidates=Collections.singletonList(CoreContractTest.descriptor("zero","I")); boolean complete=true; String fingerprint=IDENTITY.fingerprint();
-        final AtomicInteger discoveries=new AtomicInteger(),closes=new AtomicInteger(); CountDownLatch entered,exit; boolean failClose, cancel;
+        final AtomicInteger discoveries=new AtomicInteger(),closes=new AtomicInteger(); CountDownLatch entered,exit; boolean failClose, cancel, interruptAfterWait, interruptDescriptorAfterDiscovery, interruptBeforeReturn, interruptFlagDescriptorAfterDiscovery;
+        Throwable closeFailure; List<String> closeOrder; boolean clearInterruptOnClose; final AtomicBoolean closeSawInterrupt = new AtomicBoolean();
         Provider(String id,String capability) { this.id=id; this.capability=capability; }
-        public ProviderDescriptor descriptor() { return new ProviderDescriptor(id,"fixture-1",major,0,capability,dependencies); }
-        public CandidateBatch discover(CandidateRequest request) throws InterruptedException { discoveries.incrementAndGet(); if (cancel) throw new CancellationException("fixture"); if (entered!=null) entered.countDown(); if (exit!=null) await(exit); return new CandidateBatch(candidates,fingerprint,"finite-handwritten-fixture",complete); }
-        public void close() { closes.incrementAndGet(); if (failClose) throw new IllegalStateException("provider close"); }
+        public ProviderDescriptor descriptor() { if (interruptDescriptorAfterDiscovery && discoveries.get() > 0) CoreContractTest.<RuntimeException>sneakyThrow(new InterruptedException("descriptor")); if (interruptFlagDescriptorAfterDiscovery && discoveries.get() > 0) Thread.currentThread().interrupt(); return new ProviderDescriptor(id,"fixture-1",major,0,capability,dependencies); }
+        public CandidateBatch discover(CandidateRequest request) throws InterruptedException { discoveries.incrementAndGet(); if (cancel) throw new CancellationException("fixture"); if (entered!=null) entered.countDown(); if (exit!=null) await(exit); if (interruptAfterWait) throw new InterruptedException("provider"); if (interruptBeforeReturn) Thread.currentThread().interrupt(); return new CandidateBatch(candidates,fingerprint,"finite-handwritten-fixture",complete); }
+        public void close() { closes.incrementAndGet(); if (closeOrder != null) closeOrder.add(id); if (clearInterruptOnClose) closeSawInterrupt.set(Thread.interrupted()); if (closeFailure != null) CoreContractTest.<RuntimeException>sneakyThrow(closeFailure); if (failClose) throw new IllegalStateException("provider close"); }
     }
 }
