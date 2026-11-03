@@ -12,3 +12,5 @@ include(":ref-core", ":ref-diagnostics")
 if (profile == "android") include(":ref-android", ":samples:android-consumer")
 // Host JMH microbenchmarks are opt-in so verifyHost/CI configuration stays unchanged.
 if (providers.gradleProperty("meguviz.benchmarks").orNull == "true") include(":benchmark-jvm")
+// jcstress concurrency tests are opt-in for the same reason (long-running, host JVM only).
+if (providers.gradleProperty("meguviz.jcstress").orNull == "true") include(":stress-jvm")
