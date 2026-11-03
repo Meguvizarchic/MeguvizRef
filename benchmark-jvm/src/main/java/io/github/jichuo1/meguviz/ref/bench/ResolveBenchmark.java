@@ -21,6 +21,8 @@ import org.openjdk.jmh.annotations.*;
 public class ResolveBenchmark {
     static final ClassLoader LOADER = WideTarget.class.getClassLoader();
     final QuerySpec exact = QuerySpec.exact(MemberDescriptor.method(WideTarget.class.getName(), "sum", "I", "I", "I"));
+    /** Exact descriptor with reference parameter and return types (each resolved through Class.forName on a miss). */
+    final QuerySpec exactReference = QuerySpec.exact(MemberDescriptor.method(WideTarget.class.getName(), "pick", "Ljava/lang/String;", "Ljava/lang/String;"));
     final QuerySpec structural = QuerySpec.builder(WideTarget.class, MemberKind.METHOD).name("m077").parameters(int.class).build();
     /** Same shape as the Hook bridge default query: name + arity, ALL, no bridge/synthetic. */
     final QuerySpec bridgeAll = QuerySpec.builder(WideTarget.class, MemberKind.METHOD).name("pick").selection(Selection.ALL)
@@ -65,6 +67,11 @@ public class ResolveBenchmark {
     @Benchmark
     public ResolutionResult exactMissFreshScope() {
         try (CodeScope scope = CodeScope.open(LOADER)) { return scope.resolve(exact); }
+    }
+
+    @Benchmark
+    public ResolutionResult exactReferenceMissFreshScope() {
+        try (CodeScope scope = CodeScope.open(LOADER)) { return scope.resolve(exactReference); }
     }
 
     @Benchmark
