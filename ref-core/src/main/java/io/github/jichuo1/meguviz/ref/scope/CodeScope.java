@@ -40,7 +40,8 @@ public final class CodeScope implements AutoCloseable {
     private volatile Bindings bindings;
     /** Created on the first cache miss and dropped by advanceCodeEpoch; diagnostics treat null as empty. */
     private ReflectionResolver resolver;
-    private QueryCoordinator<QuerySpec, ResolutionResult> coordinator;
+    /** Keys are QuerySpec for token resolves and RawKey for resolveRaw; values are the matching result type. */
+    private QueryCoordinator<Object, Object> coordinator;
     private ProviderRegistry providers;
     private String codeFingerprint;
     private volatile String closeFailureType;
@@ -51,9 +52,18 @@ public final class CodeScope implements AutoCloseable {
     }
     private static String newIdentity() { return new UUID(IDENTITY_PREFIX, IDENTITY_SEQUENCE.incrementAndGet()).toString(); }
     public static CodeScope open(ClassLoader loader) { return new CodeScope(loader, AccessPolicy.PRESERVE_JAVA_ACCESS, 4096); }
+    /** Default capacity 4096 with an explicit access policy. */
+    public static CodeScope open(ClassLoader loader, AccessPolicy accessPolicy) { return new CodeScope(loader, accessPolicy, 4096); }
     public static CodeScope open(ClassLoader loader, AccessPolicy accessPolicy, int capacity) { return new CodeScope(loader, accessPolicy, capacity); }
     public AccessPolicy accessPolicy() { return accessPolicy; }
     public boolean usesLoader(ClassLoader candidate) { synchronized (lock) { return state == State.OPEN && loader == candidate; } }
+    /**
+     * One locked evaluation of {@code usesLoader(candidate) && identity().equals(expectedIdentity) && codeEpoch() == expectedEpoch}.
+     * A null identity never matches.
+     */
+    public boolean isCurrent(ClassLoader candidate, String expectedIdentity, long expectedEpoch) {
+        synchronized (lock) { return state == State.OPEN && loader == candidate && identity.equals(expectedIdentity) && codeEpoch == expectedEpoch; }
+    }
     public State state() { synchronized (lock) { return state; } }
     public long codeEpoch() { synchronized (lock) { return codeEpoch; } }
     public String identity() { synchronized (lock) { return identity; } }
@@ -78,11 +88,55 @@ public final class CodeScope implements AutoCloseable {
             ResolutionResult cached = cache.get(query);
             if (cached != null) { cacheHits++; return cached; }
             admission.incrementAndGet(); // OPEN under the lock, so CLOSING cannot be set concurrently
-            if (resolver == null) { resolver = new ReflectionResolver(capacity); coordinator = new QueryCoordinator<>(Math.min(capacity, 256)); }
-            context = new Context(loader, identity, codeEpoch, resolver, coordinator, providers, codeFingerprint);
+            context = context();
+        }
+        try { return (ResolutionResult) coordinate(context, query, query, () -> resolveUncached(query, context)); }
+        finally { release(); }
+    }
+    /**
+     * Same lookup, statuses and receipt as {@link #resolve}, but returns raw members without creating bindings or
+     * caching the result, so it never reports binding_capacity. A cached token result for an equal query is reused.
+     * Each returned member is prepared like {@link #exportRaw}: under TRY_SUPPRESS_JAVA_CHECKS the first rejected
+     * setAccessible throws IllegalAccessException. The members are an explicit ownership escape and survive close.
+     */
+    public RawResolution resolveRaw(QuerySpec query) throws IllegalAccessException {
+        Objects.requireNonNull(query);
+        Context context = null;
+        RawResolution hit = null;
+        synchronized (lock) {
+            if (state != State.OPEN) return RawResolution.failed(failure(query, ResolutionStatus.STALE, "scope_closed"));
+            if (Thread.currentThread().isInterrupted()) return RawResolution.failed(failure(query, ResolutionStatus.CANCELLED, "interrupted"));
+            resolved = true;
+            ResolutionResult cached = cache.get(query);
+            admission.incrementAndGet(); // access preparation below still counts as in-flight work
+            if (cached != null) { cacheHits++; hit = raw(cached); } else context = context();
         }
         try {
-            return context.coordinator.execute(query, () -> resolveUncached(query, context), 2000, interrupted -> {
+            RawResolution result = hit;
+            if (result == null) {
+                Context miss = context;
+                Object value = coordinate(miss, new RawKey(query), query, () -> resolveUncachedRaw(query, miss));
+                result = value instanceof RawResolution ? (RawResolution) value : RawResolution.failed((ResolutionResult) value);
+            }
+            for (Member member : result.members()) prepareAccess(member);
+            return result;
+        } finally { release(); }
+    }
+    /** Caller holds the lock with the scope OPEN. */
+    private Context context() {
+        if (resolver == null) { resolver = new ReflectionResolver(capacity); coordinator = new QueryCoordinator<>(Math.min(capacity, 256)); }
+        return new Context(loader, identity, codeEpoch, resolver, coordinator, providers, codeFingerprint);
+    }
+    /** Caller holds the lock; cached tokens always belong to the current bindings. */
+    private RawResolution raw(ResolutionResult cached) {
+        List<Member> members = new ArrayList<>(cached.members().size());
+        for (ResolvedMember token : cached.members()) members.add(bindings.find(token).member);
+        return new RawResolution(cached.status(), members, cached.receipt());
+    }
+    /** Single-flight miss shared by both result shapes; coordinator failures map to the same incomplete results. */
+    private static Object coordinate(Context context, Object key, QuerySpec query, java.util.function.Supplier<Object> work) {
+        try {
+            return context.coordinator.execute(key, work, 2000, interrupted -> {
                 Thread.currentThread().interrupt();
                 return failure(query, ResolutionStatus.CANCELLED, "wait_interrupted", ResolutionReceipt.InterruptionOrigin.SINGLE_FLIGHT_WAITER);
             });
@@ -94,7 +148,23 @@ public final class CodeScope implements AutoCloseable {
         catch (IllegalStateException e) {
             if ("recursive or cyclic query".equals(e.getMessage())) return failure(query, ResolutionStatus.PARTIAL, "recursive_or_cyclic_query");
             throw e;
-        } finally { release(); }
+        }
+    }
+    private RawResolution resolveUncachedRaw(QuerySpec query, Context context) {
+        synchronized (lock) {
+            if (!current(context)) return RawResolution.failed(failure(query, ResolutionStatus.STALE, "scope_invalidated"));
+            ResolutionResult cached = cache.get(query);
+            if (cached != null) { cacheHits++; return raw(cached); }
+        }
+        ReflectionResolver.Outcome outcome = context.resolver.resolve(query, context.loader, context.providers, context.codeFingerprint);
+        synchronized (lock) {
+            // Nothing is published here; the lock orders the currency check against close and epoch changes.
+            if (!current(context)) return RawResolution.failed(failure(query, ResolutionStatus.STALE, "scope_invalidated"));
+            List<Member> members = new ArrayList<>(outcome.entries.size());
+            List<MemberDescriptor> descriptors = new ArrayList<>(outcome.entries.size());
+            for (ReflectionResolver.Entry entry : outcome.entries) { members.add(entry.member); descriptors.add(entry.descriptor); }
+            return new RawResolution(outcome.status, members, new ResolutionReceipt(query.summary(), query.selection(), outcome.status, outcome.coverage, descriptors, outcome.reason, outcome.cause));
+        }
     }
     private ResolutionResult resolveUncached(QuerySpec query, Context context) {
         synchronized (lock) {
@@ -144,6 +214,12 @@ public final class CodeScope implements AutoCloseable {
     public MethodPlan bindMethod(ResolvedMember member) throws IllegalAccessException { prepare(member, MemberKind.METHOD); return new MethodPlan(this, member); }
     public FieldPlan bindField(ResolvedMember member) throws IllegalAccessException { prepare(member, MemberKind.FIELD); return new FieldPlan(this, member); }
     public ConstructorPlan bindConstructor(ResolvedMember member) throws IllegalAccessException { prepare(member, MemberKind.CONSTRUCTOR); return new ConstructorPlan(this, member); }
+    /** {@code bindMethod(resolve(query).requireSingle())}: only a RESOLVED single result binds, otherwise ResolutionException. */
+    public MethodPlan bindMethod(QuerySpec query) throws IllegalAccessException { return bindMethod(resolve(query).requireSingle()); }
+    /** {@code bindField(resolve(query).requireSingle())}. */
+    public FieldPlan bindField(QuerySpec query) throws IllegalAccessException { return bindField(resolve(query).requireSingle()); }
+    /** {@code bindConstructor(resolve(query).requireSingle())}. */
+    public ConstructorPlan bindConstructor(QuerySpec query) throws IllegalAccessException { return bindConstructor(resolve(query).requireSingle()); }
     private void prepare(ResolvedMember token, MemberKind kind) throws IllegalAccessException {
         if (token.descriptor().kind() != kind) throw new IllegalArgumentException("wrong member kind");
         Member member = acquire(token);
@@ -192,7 +268,7 @@ public final class CodeScope implements AutoCloseable {
     }
     public void advanceCodeEpoch(String reason) {
         if (reason == null || reason.isEmpty()) throw new IllegalArgumentException("invalidation reason");
-        QueryCoordinator<QuerySpec, ResolutionResult> oldCoordinator;
+        QueryCoordinator<Object, Object> oldCoordinator;
         synchronized (lock) {
             if (state != State.OPEN) throw new StalePlanException("scope closed");
             if (codeEpoch == Long.MAX_VALUE) { identity = newIdentity(); codeEpoch = 0; } else codeEpoch++;
@@ -215,7 +291,7 @@ public final class CodeScope implements AutoCloseable {
     }
     @Override public void close() {
         ProviderRegistry retired = null;
-        QueryCoordinator<QuerySpec, ResolutionResult> previous;
+        QueryCoordinator<Object, Object> previous;
         synchronized (lock) {
             if (state != State.OPEN) return;
             int inFlight = admission.getAndAdd(CLOSING); // linearization point; OPEN implies CLOSING was clear
@@ -291,14 +367,21 @@ public final class CodeScope implements AutoCloseable {
             return slot;
         }
     }
+    /** Single-flight key for resolveRaw, distinct from the token flight of an equal query. */
+    private static final class RawKey {
+        final QuerySpec query;
+        RawKey(QuerySpec query) { this.query = query; }
+        @Override public boolean equals(Object other) { return other instanceof RawKey && query.equals(((RawKey) other).query); }
+        @Override public int hashCode() { return ~query.hashCode(); }
+    }
     private static final class Context {
         final ClassLoader loader;
         final String identity, codeFingerprint;
         final long epoch;
         final ReflectionResolver resolver;
-        final QueryCoordinator<QuerySpec, ResolutionResult> coordinator;
+        final QueryCoordinator<Object, Object> coordinator;
         final ProviderRegistry providers;
-        Context(ClassLoader loader, String identity, long epoch, ReflectionResolver resolver, QueryCoordinator<QuerySpec, ResolutionResult> coordinator, ProviderRegistry providers, String codeFingerprint) {
+        Context(ClassLoader loader, String identity, long epoch, ReflectionResolver resolver, QueryCoordinator<Object, Object> coordinator, ProviderRegistry providers, String codeFingerprint) {
             this.loader = loader; this.identity = identity; this.epoch = epoch; this.resolver = resolver; this.coordinator = coordinator; this.providers = providers; this.codeFingerprint = codeFingerprint;
         }
     }

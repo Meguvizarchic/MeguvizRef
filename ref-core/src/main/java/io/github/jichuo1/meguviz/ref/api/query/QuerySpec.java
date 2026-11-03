@@ -57,6 +57,12 @@ public final class QuerySpec {
         return new Builder(descriptor.owner(), null, descriptor.kind()).exact(descriptor).build();
     }
     public static Builder builder(Class<?> owner, MemberKind kind) { return new Builder(owner.getName(), owner, kind); }
+    /** {@code builder(owner, METHOD).name(name).parameters(parameters).build()}: UNIQUE, DECLARED, exact parameter Class identities. */
+    public static QuerySpec method(Class<?> owner, String name, Class<?>... parameters) { return builder(owner, MemberKind.METHOD).name(name).parameters(parameters).build(); }
+    /** {@code builder(owner, FIELD).name(name).build()}: UNIQUE, DECLARED. */
+    public static QuerySpec field(Class<?> owner, String name) { return builder(owner, MemberKind.FIELD).name(name).build(); }
+    /** {@code builder(owner, CONSTRUCTOR).parameters(parameters).build()}: UNIQUE, exact parameter Class identities. */
+    public static QuerySpec constructor(Class<?> owner, Class<?>... parameters) { return builder(owner, MemberKind.CONSTRUCTOR).parameters(parameters).build(); }
     public static Builder builder(String owner, MemberKind kind) { return new Builder(owner, null, kind); }
     public String owner() { return owner; }
     public String name() { return name; }

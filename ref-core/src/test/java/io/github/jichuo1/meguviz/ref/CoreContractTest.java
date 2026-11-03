@@ -7,6 +7,7 @@ import io.github.jichuo1.meguviz.ref.api.result.*;
 import io.github.jichuo1.meguviz.ref.runtime.invoke.*;
 import io.github.jichuo1.meguviz.ref.runtime.resolve.*;
 import io.github.jichuo1.meguviz.ref.scope.CodeScope;
+import io.github.jichuo1.meguviz.ref.scope.RawResolution;
 import io.github.jichuo1.meguviz.ref.spi.*;
 import java.io.*;
 import java.lang.ref.WeakReference;
@@ -38,6 +39,7 @@ public final class CoreContractTest {
         scopeFastPathContracts();
         memberTableContracts();
         descriptorFastPathContracts();
+        apiAdditionContracts();
         if (args.length > 0) {
             Path output = Path.of(args[0]); Files.createDirectories(output.toAbsolutePath().getParent());
             Files.writeString(output, "<?xml version=\"1.0\" encoding=\"UTF-8\"?><testsuite name=\"MeguvizRef.CoreContracts\" tests=\"" + count + "\" failures=\"" + failures + "\">" + String.join("", xml) + "</testsuite>");
@@ -1066,6 +1068,166 @@ public final class CoreContractTest {
             QuerySpec exact = QuerySpec.exact(descriptor("zero", "I"));
             eq(QuerySpec.RULE_VERSION + ":METHOD:" + Target.class.getName() + ":zero:EXACT:DECLARED:" + Target.class.getName() + "#zero()I:null:null:null:-1:16384:4096:256:null:null:null:null:null", exact.summary());
         });
+    }
+    private static void apiAdditionContracts() {
+        test("query-shortcuts-equal-builder-forms", () -> {
+            QuerySpec method = QuerySpec.method(Target.class, "four", int.class, int.class, int.class, int.class);
+            QuerySpec built = QuerySpec.builder(Target.class, MemberKind.METHOD).name("four").parameters(int.class, int.class, int.class, int.class).build();
+            eq(built, method); eq(built.hashCode(), method.hashCode()); eq(built.summary(), method.summary());
+            eq(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").parameters().build(), QuerySpec.method(Target.class, "zero"));
+            eq(QuerySpec.builder(Target.class, MemberKind.FIELD).name("number").build(), QuerySpec.field(Target.class, "number"));
+            eq(QuerySpec.builder(Target.class, MemberKind.CONSTRUCTOR).parameters(int.class).build(), QuerySpec.constructor(Target.class, int.class));
+            eq(0, QuerySpec.constructor(Target.class).parameterCount()); eq(-1, QuerySpec.field(Target.class, "number").parameterCount());
+            expect(IllegalArgumentException.class, () -> QuerySpec.method(Target.class, null)); expect(IllegalArgumentException.class, () -> QuerySpec.method(Target.class, "four", (Class<?>) null));
+            expect(IllegalArgumentException.class, () -> QuerySpec.field(Target.class, "")); expect(NullPointerException.class, () -> QuerySpec.method(null, "x"));
+        });
+        test("bind-query-shortcuts-require-single", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER)) {
+                eq("string", scope.bindMethod(QuerySpec.method(Target.class, "pick", String.class)).call(new Target(), "x"));
+                eq(ResolutionStatus.AMBIGUOUS, expect(ResolutionException.class, () -> scope.bindMethod(QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").build())).status());
+                eq(ResolutionStatus.NOT_FOUND_IN_VISIBLE_UNIVERSE, expect(ResolutionException.class, () -> scope.bindMethod(QuerySpec.method(Target.class, "pick", Object.class))).status());
+                Target target = new Target(); FieldPlan field = scope.bindField(QuerySpec.field(Target.class, "number")); field.set(target, 7); eq(7, field.get(target));
+                eq(5, ((Target) scope.bindConstructor(QuerySpec.constructor(Target.class, int.class)).create(5)).number);
+                expect(IllegalArgumentException.class, () -> scope.bindMethod(QuerySpec.field(Target.class, "number")));
+            }
+            CodeScope closed = CodeScope.open(LOADER); closed.close();
+            eq(ResolutionStatus.STALE, expect(ResolutionException.class, () -> closed.bindMethod(QuerySpec.method(Target.class, "zero"))).status());
+        });
+        test("plan-varargs-call-matches-invoke", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER)) {
+                MethodPlan four = scope.bindMethod(QuerySpec.method(Target.class, "four", int.class, int.class, int.class, int.class));
+                MethodPlan varargs = scope.bindMethod(QuerySpec.method(Target.class, "varargs", String[].class));
+                MethodPlan zero = scope.bindMethod(QuerySpec.method(Target.class, "zero")), fail = scope.bindMethod(QuerySpec.method(Target.class, "throwOnce"));
+                Target target = new Target();
+                eq(10, four.call(target, 1, 2, 3, 4)); eq(10, four.call(target, new Object[]{1, 2, 3, 4})); eq(0, zero.call(target));
+                eq(2, varargs.call(target, (Object) new String[]{"a", "b"}));
+                Object[][] cases = {{null, new Object[]{1, 2, 3, 4}}, {target, new Object[]{1, 2, 3}}, {target, new Object[]{1, "2", 3, 4}}, {"wrong", new Object[]{1, 2, 3, 4}}, {target, null}};
+                for (Object[] item : cases) eq(failureType(() -> four.invoke(item[0], (Object[]) item[1])), failureType(() -> four.call(item[0], (Object[]) item[1])));
+                eq(failureType(() -> fail.invoke(target, new Object[0])), failureType(() -> fail.call(target))); eq(2, target.calls);
+                ConstructorPlan constructor = scope.bindConstructor(QuerySpec.constructor(Target.class, int.class));
+                eq(failureType(() -> constructor.newInstance(new Object[]{-1})), failureType(() -> constructor.create(-1)));
+                eq(failureType(() -> constructor.newInstance(new Object[0])), failureType(() -> constructor.create()));
+                scope.close(); expect(StalePlanException.class, () -> four.call(target, 1, 2, 3, 4)); expect(StalePlanException.class, () -> constructor.create(1));
+            }
+        });
+        test("open-with-policy-uses-default-capacity", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.TRY_SUPPRESS_JAVA_CHECKS)) {
+                eq(AccessPolicy.TRY_SUPPRESS_JAVA_CHECKS, scope.accessPolicy());
+                Field capacity = CodeScope.class.getDeclaredField("capacity"); capacity.setAccessible(true); eq(4096, capacity.getInt(scope));
+                eq(42, scope.bindMethod(QuerySpec.method(Target.class, "privateValue")).call(new Target()));
+            }
+            expect(NullPointerException.class, () -> CodeScope.open(LOADER, null));
+        });
+        test("is-current-equals-three-separate-checks", () -> {
+            ClassLoader other = new URLClassLoader(new URL[0], null);
+            CodeScope scope = CodeScope.open(LOADER);
+            try {
+                for (int phase = 0; phase < 3; phase++) {
+                    if (phase == 1) scope.advanceCodeEpoch("is-current");
+                    if (phase == 2) scope.close();
+                    String id = scope.identity(); long epoch = scope.codeEpoch();
+                    for (ClassLoader loader : new ClassLoader[]{LOADER, other, null})
+                        for (String identity : new String[]{id, new String(id), "other", null})
+                            for (long candidate : new long[]{epoch, epoch + 1, epoch - 1})
+                                eq(scope.usesLoader(loader) && scope.identity().equals(identity) && scope.codeEpoch() == candidate, scope.isCurrent(loader, identity, candidate));
+                    eq(phase < 2, scope.isCurrent(LOADER, id, epoch));
+                }
+                try (CodeScope nullLoader = CodeScope.open(null)) { check(nullLoader.isCurrent(null, nullLoader.identity(), 0), "bootstrap loader scope"); }
+            } finally { scope.close(); }
+        });
+        test("resolve-raw-matches-resolve-without-bindings-or-cache", () -> {
+            List<QuerySpec> queries = Arrays.asList(
+                    QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").selection(Selection.ALL).build(),
+                    QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").build(),
+                    QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").selection(Selection.FIRST).build(),
+                    QuerySpec.builder(Target.class, MemberKind.METHOD).name("noSuchMethod").build(),
+                    QuerySpec.builder(Target.class, MemberKind.METHOD).name("noSuchMethod").candidateBudget(1).build(),
+                    QuerySpec.builder(Child.class, MemberKind.METHOD).name("hashCode").parameters().hierarchy(Hierarchy.SUPERCLASSES).build(),
+                    QuerySpec.builder(Child.class, MemberKind.FIELD).name("shadow").hierarchy(Hierarchy.SUPERCLASSES).build(),
+                    QuerySpec.builder("missing.Owner", MemberKind.METHOD).name("x").build(),
+                    QuerySpec.exact(descriptor("four", "I", "I", "I", "I", "I")), QuerySpec.exact(descriptor("four", "J", "I", "I", "I", "I")),
+                    QuerySpec.constructor(Target.class, int.class), QuerySpec.field(Target.class, "number"));
+            try (CodeScope raw = CodeScope.open(LOADER)) {
+                for (int pass = 0; pass < 2; pass++) for (QuerySpec query : queries) {
+                    try (CodeScope tokens = CodeScope.open(LOADER)) {
+                        ResolutionResult expected = tokens.resolve(query); RawResolution actual = raw.resolveRaw(query);
+                        eq(expected.status(), actual.status()); eq(expected.receipt().reason(), actual.receipt().reason());
+                        eq(expected.receipt().querySummary(), actual.receipt().querySummary()); eq(expected.receipt().selection(), actual.receipt().selection());
+                        eq(expected.receipt().coverage().complete(), actual.receipt().coverage().complete()); eq(expected.receipt().coverage().inspected(), actual.receipt().coverage().inspected());
+                        eq(expected.receipt().coverage().universe(), actual.receipt().coverage().universe()); eq(expected.receipt().descriptors(), actual.receipt().descriptors());
+                        eq(expected.receipt().causeType(), actual.receipt().causeType()); eq(ResolutionReceipt.InterruptionOrigin.UNKNOWN, actual.receipt().interruptionOrigin());
+                        eq(expected.members().size(), actual.members().size());
+                        for (int i = 0; i < expected.members().size(); i++) eq(tokens.exportRaw(expected.members().get(i)), actual.members().get(i));
+                        expect(UnsupportedOperationException.class, () -> actual.members().clear());
+                    }
+                }
+                eq(0L, raw.diagnostics().get("bindings")); eq(0L, raw.diagnostics().get("cachedQueries")); eq(0L, raw.diagnostics().get("cacheHits")); eq(0L, raw.diagnostics().get("inFlight"));
+            }
+        });
+        test("resolve-raw-reuses-cached-token-result", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER)) {
+                QuerySpec query = QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").selection(Selection.ALL).build();
+                ResolutionResult tokens = scope.resolve(query); RawResolution raw = scope.resolveRaw(query);
+                eq(1L, scope.diagnostics().get("cacheHits")); check(raw.receipt() == tokens.receipt(), "same receipt");
+                for (int i = 0; i < tokens.members().size(); i++) check(scope.exportRaw(tokens.members().get(i)) == raw.members().get(i), "slot member instance");
+                eq(2L, scope.diagnostics().get("bindings")); eq(1L, scope.diagnostics().get("cachedQueries"));
+            }
+        });
+        test("resolve-raw-ignores-binding-capacity", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 1)) {
+                scope.bindMethod(QuerySpec.method(Target.class, "zero"));
+                QuerySpec both = QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").selection(Selection.ALL).build();
+                RawResolution raw = scope.resolveRaw(both); eq(ResolutionStatus.ALL_MATCHES, raw.status()); eq(2, raw.members().size()); check(raw.receipt().coverage().complete(), "complete");
+                ResolutionResult tokens = scope.resolve(both); eq(ResolutionStatus.PARTIAL, tokens.status()); eq("binding_capacity", tokens.receipt().reason());
+                eq(1L, scope.diagnostics().get("bindings"));
+                for (int i = 0; i < 5; i++) eq(2, scope.resolveRaw(QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").selection(Selection.ALL).candidateBudget(100 + i).build()).members().size());
+                eq(1L, scope.diagnostics().get("bindings"));
+            }
+        });
+        test("resolve-raw-applies-access-policy-and-outlives-close", () -> {
+            QuerySpec hidden = QuerySpec.method(Target.class, "privateValue");
+            CodeScope suppress = CodeScope.open(LOADER, AccessPolicy.TRY_SUPPRESS_JAVA_CHECKS);
+            Method open = (Method) suppress.resolveRaw(hidden).members().get(0); check(accessibleFlag(open), "setAccessible applied");
+            suppress.close(); eq(42, open.invoke(new Target()));
+            try (CodeScope preserve = CodeScope.open(LOADER)) { check(!accessibleFlag(preserve.resolveRaw(hidden).members().get(0)), "access unchanged"); }
+        });
+        test("resolve-raw-closed-and-interrupted", () -> {
+            CodeScope scope = CodeScope.open(LOADER);
+            try {
+                Thread.currentThread().interrupt();
+                RawResolution cancelled = scope.resolveRaw(QuerySpec.method(Target.class, "zero"));
+                check(Thread.currentThread().isInterrupted(), "flag preserved"); eq(ResolutionStatus.CANCELLED, cancelled.status()); eq("interrupted", cancelled.receipt().reason()); check(cancelled.members().isEmpty(), "no members");
+            } finally { Thread.interrupted(); }
+            scope.close();
+            RawResolution stale = scope.resolveRaw(QuerySpec.method(Target.class, "zero"));
+            eq(ResolutionStatus.STALE, stale.status()); eq("scope_closed", stale.receipt().reason()); check(stale.members().isEmpty(), "no members");
+        });
+        test("resolve-raw-provider-single-flight-and-drain", () -> {
+            Provider provider = new Provider("p", ""); provider.entered = new CountDownLatch(1); provider.exit = new CountDownLatch(1);
+            CodeScope scope = providerScope(provider); ExecutorService executor = Executors.newFixedThreadPool(2);
+            try {
+                Future<RawResolution> owner = executor.submit(() -> scope.resolveRaw(providerQuery())); await(provider.entered);
+                Future<RawResolution> waiter = executor.submit(() -> scope.resolveRaw(providerQuery()));
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2); while (scope.diagnostics().get("inFlight") < 2 && System.nanoTime() < deadline) Thread.yield();
+                eq(2L, scope.diagnostics().get("inFlight")); provider.exit.countDown();
+                RawResolution first = owner.get(3, TimeUnit.SECONDS), second = waiter.get(3, TimeUnit.SECONDS);
+                eq(ResolutionStatus.RESOLVED, first.status()); check(first == second, "shared flight"); eq(1, provider.discoveries.get());
+                eq(Target.class.getDeclaredMethod("zero"), first.members().get(0)); eq(0L, scope.diagnostics().get("bindings"));
+            } finally { provider.exit.countDown(); scope.close(); executor.shutdownNow(); }
+            Provider blocking = new Provider("p", ""); blocking.entered = new CountDownLatch(1); blocking.exit = new CountDownLatch(1);
+            CodeScope closing = providerScope(blocking); ExecutorService single = Executors.newSingleThreadExecutor();
+            try {
+                Future<RawResolution> inFlight = single.submit(() -> closing.resolveRaw(providerQuery())); await(blocking.entered);
+                closing.close(); eq(CodeScope.State.RETIRING, closing.state()); eq(0, blocking.closes.get());
+                blocking.exit.countDown(); RawResolution late = inFlight.get(3, TimeUnit.SECONDS);
+                eq(ResolutionStatus.STALE, late.status()); eq("scope_invalidated", late.receipt().reason()); check(late.members().isEmpty(), "no members after close");
+                eq(1, blocking.closes.get()); eq(CodeScope.State.CLOSED, closing.state());
+            } finally { blocking.exit.countDown(); closing.close(); single.shutdownNow(); }
+        });
+    }
+    @SuppressWarnings("deprecation") private static boolean accessibleFlag(Member member) { return ((AccessibleObject) member).isAccessible(); }
+    private static String failureType(Checked action) {
+        try { action.run(); return "none"; } catch (Throwable failure) { return failure.getClass().getName() + (failure.getCause() == null ? "" : "<" + failure.getCause().getClass().getName()); }
     }
     private static String outcome(Callable<String> action) {
         try { return "value:" + action.call(); } catch (Exception failure) { return "error:" + failure.getClass().getName() + ":" + failure.getMessage(); }
