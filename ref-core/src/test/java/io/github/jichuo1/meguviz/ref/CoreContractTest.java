@@ -37,6 +37,7 @@ public final class CoreContractTest {
         concurrencyContracts();
         scopeFastPathContracts();
         memberTableContracts();
+        descriptorFastPathContracts();
         if (args.length > 0) {
             Path output = Path.of(args[0]); Files.createDirectories(output.toAbsolutePath().getParent());
             Files.writeString(output, "<?xml version=\"1.0\" encoding=\"UTF-8\"?><testsuite name=\"MeguvizRef.CoreContracts\" tests=\"" + count + "\" failures=\"" + failures + "\">" + String.join("", xml) + "</testsuite>");
@@ -1021,6 +1022,86 @@ public final class CoreContractTest {
                 eq((long) names.length, scope.diagnostics().get("bindings"));
             } finally { executor.shutdownNow(); }
         });
+    }
+    private static void descriptorFastPathContracts() {
+        test("type-descriptor-validation-matches-previous-implementation", () -> {
+            List<String> corpus = new ArrayList<>(Arrays.asList("", "V", "Z", "I", "D", "X", "L", "L;", "La;", "[I", "[V", "[[V", "[", "[[", "[L;", "[La;", "[[Ljava/lang/String;",
+                    "Ljava/lang/String;", "Ljava.lang.String;", "L/a;", "La/;", "La//b;", "La/b;;", "La;b;", "La[b;", "La(b;", "La)b;", "La b;", "La\tb;", "La\u2003b;", "La\u00a0b;",
+                    "La/b", "a/b;", "II", "IV", "VV", "(I)V", "L//;", "L/;", "Lx;y", "[" .repeat(255) + "I", "[".repeat(256) + "I", "[".repeat(255) + "V", "L" + "a".repeat(4094) + ";", "L" + "a".repeat(4095) + ";",
+                    "La$b;", "La/b$0x1;", "Lcom/example/Foo/0x0000000800c00400;", "L\u00e9;", "[Lx//y;", "[L/x;"));
+            Random random = new Random(42); String alphabet = "[L;/.()VIZa b$";
+            for (int i = 0; i < 20000; i++) { StringBuilder value = new StringBuilder(); int length = random.nextInt(9); for (int c = 0; c < length; c++) value.append(alphabet.charAt(random.nextInt(alphabet.length()))); corpus.add(value.toString()); }
+            for (String value : corpus) eq(outcome(() -> previousTypeOf(value)), outcome(() -> TypeDescriptor.of(value).value()));
+            eq(outcome(() -> previousTypeOf(null)), outcome(() -> TypeDescriptor.of(null).value()));
+            for (Class<?> type : new Class<?>[]{void.class, boolean.class, byte.class, char.class, short.class, int.class, long.class, float.class, double.class, String.class, int[].class, String[][].class, Map.Entry.class})
+                eq(previousTypeOf(type.isArray() ? type.getName().replace('.', '/') : type.isPrimitive() ? TypeDescriptor.fromClass(type).value() : "L" + type.getName().replace('.', '/') + ";"), TypeDescriptor.fromClass(type).value());
+        });
+        test("owner-normalization-matches-previous-implementation", () -> {
+            Runnable lambda = () -> { };
+            String hidden = lambda.getClass().getName(); check(hidden.indexOf('/') > 0, "lambda proxy is a hidden class: " + hidden);
+            for (String owner : new String[]{"java.lang.String", "java/lang/String", "a.b/c", hidden, "a..b", "a//b", ".a", "a.", "/a", "a/", "a;b", "a b", "a[]", "", "x".repeat(4094), "x".repeat(4095)}) {
+                eq(outcome(() -> previousOwner(owner)), outcome(() -> MemberDescriptor.field(owner, "f", "I").owner()));
+                eq(outcome(() -> previousOwner(owner)), outcome(() -> QuerySpec.builder(owner, MemberKind.FIELD).build().owner()));
+            }
+            Method run = lambda.getClass().getDeclaredMethod("run");
+            eq(previousOwner(hidden), MemberDescriptor.from(run).owner()); eq(MemberDescriptor.from(run), new MethodSchema(run).descriptor());
+        });
+        test("descriptor-from-and-schema-match-string-round-trip", () -> {
+            List<Member> members = new ArrayList<>();
+            for (Class<?> owner : new Class<?>[]{String.class, Target.class, Child.class, Parent.class, ArityFixture.class, HashMap.class, Thread.State.class}) {
+                members.addAll(Arrays.asList(owner.getDeclaredMethods())); members.addAll(Arrays.asList(owner.getDeclaredFields())); members.addAll(Arrays.asList(owner.getDeclaredConstructors()));
+            }
+            for (Member member : members) {
+                MemberDescriptor expected = previousFrom(member), actual = MemberDescriptor.from(member);
+                eq(expected, actual); eq(expected.signature(), actual.signature()); eq(expected.hashCode(), actual.hashCode());
+                eq(Objects.hash(actual.kind(), actual.owner(), actual.name(), actual.parameters(), actual.type()), actual.hashCode()); eq(actual.hashCode(), actual.hashCode());
+                if (!(member instanceof Field)) { MethodSchema schema = new MethodSchema(member); eq(expected, schema.descriptor()); check(schema.rawMember() == member, "raw member"); }
+                expect(UnsupportedOperationException.class, () -> actual.parameters().add(TypeDescriptor.of("I")));
+            }
+        });
+        test("query-summary-memoized-and-unchanged", () -> {
+            QuerySpec query = QuerySpec.builder(Target.class, MemberKind.METHOD).name("four").parameters(int.class, int.class, int.class, int.class).returns(int.class).build();
+            String expected = QuerySpec.RULE_VERSION + ":METHOD:" + Target.class.getName() + ":four:UNIQUE:DECLARED:null:null:null:null:4:16384:4096:256:null:[int, int, int, int]:null:int:null";
+            eq(expected, query.summary()); check(query.summary() == query.summary(), "memoized instance");
+            QuerySpec exact = QuerySpec.exact(descriptor("zero", "I"));
+            eq(QuerySpec.RULE_VERSION + ":METHOD:" + Target.class.getName() + ":zero:EXACT:DECLARED:" + Target.class.getName() + "#zero()I:null:null:null:-1:16384:4096:256:null:null:null:null:null", exact.summary());
+        });
+    }
+    private static String outcome(Callable<String> action) {
+        try { return "value:" + action.call(); } catch (Exception failure) { return "error:" + failure.getClass().getName() + ":" + failure.getMessage(); }
+    }
+    /** Verbatim behaviour of TypeDescriptor.of in 1.0.0, kept as an independent oracle. */
+    private static String previousTypeOf(String value) {
+        Objects.requireNonNull(value, "descriptor");
+        if (value.length() == 0 || value.length() > 4096) throw new IllegalArgumentException("descriptor length");
+        int dimensions = 0;
+        while (dimensions < value.length() && value.charAt(dimensions) == '[') dimensions++;
+        if (dimensions > 255 || dimensions == value.length()) throw new IllegalArgumentException("array dimensions");
+        String element = value.substring(dimensions);
+        if (element.length() == 1 && "VZBCSIJFD".indexOf(element.charAt(0)) >= 0) {
+            if (dimensions > 0 && element.equals("V")) throw new IllegalArgumentException("void array");
+        } else if (element.startsWith("L") && element.endsWith(";") && element.length() > 2) {
+            String name = element.substring(1, element.length() - 1);
+            if (name.startsWith("/") || name.endsWith("/") || name.contains("//")) throw new IllegalArgumentException("reference name");
+            for (int i = 0; i < name.length(); i++) {
+                char c = name.charAt(i);
+                if (c == '.' || c == ';' || c == '[' || c == '(' || c == ')' || Character.isWhitespace(c)) throw new IllegalArgumentException("reference name");
+            }
+        } else throw new IllegalArgumentException("invalid descriptor: " + value);
+        return value;
+    }
+    private static String previousOwner(String owner) {
+        String value = previousTypeOf("L" + Objects.requireNonNull(owner).replace('.', '/') + ";");
+        return value.substring(1, value.length() - 1).replace('/', '.');
+    }
+    /** The 1.0.0 from(): descriptor strings first, then the validating string factories. */
+    private static MemberDescriptor previousFrom(Member member) {
+        String owner = member.getDeclaringClass().getName();
+        if (member instanceof Field) return MemberDescriptor.field(owner, member.getName(), TypeDescriptor.fromClass(((Field) member).getType()).value());
+        Class<?>[] params = member instanceof Method ? ((Method) member).getParameterTypes() : ((Constructor<?>) member).getParameterTypes();
+        String[] values = new String[params.length];
+        for (int i = 0; i < params.length; i++) values[i] = TypeDescriptor.fromClass(params[i]).value();
+        return member instanceof Method ? MemberDescriptor.method(owner, member.getName(), TypeDescriptor.fromClass(((Method) member).getReturnType()).value(), values) : MemberDescriptor.constructor(owner, values);
     }
     private static int memberTables(CodeScope scope) throws ReflectiveOperationException {
         Field field = CodeScope.class.getDeclaredField("resolver"); field.setAccessible(true);

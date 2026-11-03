@@ -16,10 +16,8 @@ public final class MethodSchema {
         } else if (member instanceof Constructor<?>) {
             parameters = ((Constructor<?>) member).getParameterTypes(); type = void.class;
         } else { parameters = new Class<?>[0]; type = ((Field) member).getType(); }
-        String[] types = new String[parameters.length];
-        for (int i = 0; i < types.length; i++) types[i] = TypeDescriptor.fromClass(parameters[i]).value();
-        MemberKind kind = member instanceof Method ? MemberKind.METHOD : member instanceof Field ? MemberKind.FIELD : MemberKind.CONSTRUCTOR;
-        descriptor = MemberDescriptor.create(kind, member.getDeclaringClass().getName(), kind == MemberKind.CONSTRUCTOR ? "<init>" : member.getName(), TypeDescriptor.fromClass(type).value(), types);
+        // Same descriptor and failure order as the former create(...) round trip, with one validation per type.
+        descriptor = MemberDescriptor.from(member);
     }
     public Class<?>[] parameterTypes() { return parameters.clone(); }
     public Class<?> type() { return type; }
