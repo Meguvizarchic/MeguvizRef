@@ -36,8 +36,9 @@ public final class CodeScope implements AutoCloseable {
     private boolean resolved;
     private final Map<QuerySpec, ResolutionResult> cache = new LinkedHashMap<>(16, .75f, true);
     /**
-     * Lock-free view of the cache's most recently used entry. Updated under the lock at every cache hit and put and
-     * cleared with the cache, so it is always the LRU tail and serving it leaves the eviction order unchanged.
+     * Lock-free view of the cache's most recently used entry. Set under the lock by a cache hit, cleared by every put
+     * (the new entry becomes the tail) and with the cache, so whenever it is non-null it is the LRU tail and serving it
+     * leaves the eviction order unchanged. A scope whose results are never hit allocates nothing for it.
      */
     private volatile Recent recent;
     /** Hits served from {@link #recent}, created with the first memo; diagnostics add its sum to cacheHits. */
@@ -207,7 +208,7 @@ public final class CodeScope implements AutoCloseable {
             ResolutionReceipt receipt = new ResolutionReceipt(query.summary(), query.selection(), outcome.status, outcome.coverage, descriptors, outcome.reason, outcome.cause);
             ResolutionResult result = new ResolutionResult(outcome.status, members, receipt);
             if (outcome.coverage.complete() && (outcome.status == ResolutionStatus.RESOLVED || outcome.status == ResolutionStatus.ALL_MATCHES)) {
-                cache.put(query, result); remember(query, result);
+                cache.put(query, result); if (recent != null) recent = null;
                 if (cache.size() > capacity) cache.remove(cache.keySet().iterator().next());
             }
             return result;
