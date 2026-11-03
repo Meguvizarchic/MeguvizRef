@@ -63,10 +63,19 @@ public final class ReflectionResolver {
         if (type == null) { type = Class.forName(name, false, loader); rememberType(loader, name, type); }
         return type;
     }
+    /** Fills the parameter types and returns the return/field type, through the cache when {@code reuse}. */
+    private Class<?> resolveTypes(MemberDescriptor d, ClassLoader loader, Class<?>[] parameters, boolean reuse) throws ClassNotFoundException {
+        if (!reuse) {
+            for (int i = 0; i < parameters.length; i++) parameters[i] = d.parameters().get(i).resolve(loader);
+            return d.type().resolve(loader);
+        }
+        for (int i = 0; i < parameters.length; i++) parameters[i] = resolveType(d.parameters().get(i), loader);
+        return resolveType(d.type(), loader);
+    }
     /** {@code descriptor.resolve(loader)} through the per-scope cache; primitives never reach the cache. */
     private Class<?> resolveType(TypeDescriptor descriptor, ClassLoader loader) throws ClassNotFoundException {
         String value = descriptor.value();
-        if (value.length() == 1 || lookups.get() < 2) return descriptor.resolve(loader);
+        if (value.length() == 1) return descriptor.resolve(loader);
         Class<?> type = loadedType(loader, value);
         if (type == null) { type = descriptor.resolve(loader); rememberType(loader, value, type); }
         return type;
@@ -101,13 +110,11 @@ public final class ReflectionResolver {
         catch (SecurityException denied) { loader = scopeLoader; }
         Class<?>[] parameters = new Class<?>[d.parameters().size()];
         Class<?> type;
-        try {
-            for (int i = 0; i < parameters.length; i++) parameters[i] = resolveType(d.parameters().get(i), loader);
-            type = resolveType(d.type(), loader);
-        } catch (SecurityException denied) {
+        boolean reuse = lookups.get() > 1; // the first lookup of a resolver takes the direct path below
+        try { type = resolveTypes(d, loader, parameters, reuse); }
+        catch (SecurityException denied) {
             if (loader == scopeLoader) throw denied;
-            for (int i = 0; i < parameters.length; i++) parameters[i] = resolveType(d.parameters().get(i), scopeLoader);
-            type = resolveType(d.type(), scopeLoader);
+            type = resolveTypes(d, scopeLoader, parameters, reuse);
         }
         try {
             Member member;
