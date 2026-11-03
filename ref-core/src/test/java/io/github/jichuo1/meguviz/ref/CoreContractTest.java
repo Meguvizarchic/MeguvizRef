@@ -745,6 +745,29 @@ public final class CoreContractTest {
                 await(provider.entered); provider.exit.countDown(); for (Future<ResolutionResult> future : futures) future.get(3, TimeUnit.SECONDS).requireSingle(); eq(1, provider.discoveries.get());
             } finally { provider.exit.countDown(); executor.shutdownNow(); }
         });
+        test("single-flight-future-created-only-for-waiters", () -> {
+            QueryCoordinator<String,Integer> coordinator = new QueryCoordinator<>(4); CountDownLatch entered = new CountDownLatch(1), exit = new CountDownLatch(1);
+            ExecutorService executor = Executors.newFixedThreadPool(2); Field flights = field(QueryCoordinator.class, "flights");
+            try {
+                eq(5, coordinator.execute("solo", () -> 5, 100)); eq(0, ((Map<?, ?>) flights.get(coordinator)).size());
+                Future<Integer> owner = executor.submit(() -> coordinator.execute("q", () -> { entered.countDown(); blockingAwait(exit); return 7; }, 1000)); await(entered);
+                Object flight; synchronized (coordinator) { flight = ((Map<?, ?>) flights.get(coordinator)).get("q"); }
+                Field future = field(flight.getClass(), "future"); synchronized (coordinator) { eq(null, future.get(flight)); }
+                Future<Integer> waiter = executor.submit(() -> coordinator.execute("q", () -> 8, 2000));
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2); Object created = null;
+                while (created == null && System.nanoTime() < deadline) { synchronized (coordinator) { created = future.get(flight); } Thread.yield(); }
+                check(created != null, "first waiter created the future"); exit.countDown();
+                eq(7, owner.get(3, TimeUnit.SECONDS)); eq(7, waiter.get(3, TimeUnit.SECONDS)); eq(0, ((Map<?, ?>) flights.get(coordinator)).size());
+                RuntimeException failure = new IllegalStateException("owner failed"); CountDownLatch failing = new CountDownLatch(1), release = new CountDownLatch(1);
+                Future<Integer> failedOwner = executor.submit(() -> coordinator.execute("f", () -> { failing.countDown(); blockingAwait(release); throw failure; }, 1000)); await(failing);
+                Future<Integer> failedWaiter = executor.submit(() -> coordinator.execute("f", () -> 9, 2000));
+                deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2); boolean attached = false;
+                while (!attached && System.nanoTime() < deadline) { synchronized (coordinator) { Object f = ((Map<?, ?>) flights.get(coordinator)).get("f"); attached = f != null && future.get(f) != null; } Thread.yield(); }
+                check(attached, "waiter attached"); release.countDown();
+                check(expect(ExecutionException.class, () -> failedOwner.get(3, TimeUnit.SECONDS)).getCause() == failure, "owner sees its failure");
+                check(expect(ExecutionException.class, () -> failedWaiter.get(3, TimeUnit.SECONDS)).getCause() == failure, "waiter sees the owner failure");
+            } finally { exit.countDown(); coordinator.close(); executor.shutdownNow(); }
+        });
         test("single-flight-reentrant-does-not-deadlock", () -> {
             QueryCoordinator<String,Integer> coordinator = new QueryCoordinator<>(4);
             expect(IllegalStateException.class, () -> coordinator.execute("q", () -> { try { return coordinator.execute("q", () -> 2, 100); } catch (InterruptedException | TimeoutException e) { throw new AssertionError(e); } }, 100));
