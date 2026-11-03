@@ -6,6 +6,7 @@ import io.github.jichuo1.meguviz.ref.api.query.Hierarchy;
 import io.github.jichuo1.meguviz.ref.api.query.QuerySpec;
 import io.github.jichuo1.meguviz.ref.api.query.Selection;
 import io.github.jichuo1.meguviz.ref.api.result.ResolutionResult;
+import io.github.jichuo1.meguviz.ref.api.result.ResolvedMember;
 import io.github.jichuo1.meguviz.ref.scope.CodeScope;
 import java.util.concurrent.TimeUnit;
 import org.openjdk.jmh.annotations.*;
@@ -79,6 +80,26 @@ public class ResolveBenchmark {
     @Benchmark
     public ResolutionResult inheritedMissFreshScope() {
         try (CodeScope scope = CodeScope.open(LOADER)) { return scope.resolve(inherited); }
+    }
+
+    /** Bridge default resolver shape on Ref 1.0.0 API: fresh scope, ALL query, exportRaw for every token. */
+    @Benchmark
+    public int bridgeAllExportFreshScope() throws Exception {
+        int total = 0;
+        try (CodeScope scope = CodeScope.open(LOADER)) {
+            for (ResolvedMember token : scope.resolve(bridgeAll).members()) total += scope.exportRaw(token).getModifiers();
+        }
+        return total;
+    }
+
+    /** Bridge session shape on Ref 1.0.0 API: one scope, eight different ALL queries, exportRaw for every token. */
+    @Benchmark
+    public int sessionEightQueriesExport() throws Exception {
+        int total = 0;
+        try (CodeScope scope = CodeScope.open(LOADER)) {
+            for (QuerySpec query : session) for (ResolvedMember token : scope.resolve(query).members()) total += scope.exportRaw(token).getModifiers();
+        }
+        return total;
     }
 
     /** Eight different structural queries on the same 155-method owner inside one scope (session-style misses). */
