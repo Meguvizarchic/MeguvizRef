@@ -31,10 +31,11 @@ MUTATIONS = [
      "for (int cell = 1; cell <= CELLS; cell++) if (table.getAndAdd(cell * STRIDE, CLOSING) == 0) idle++;",
      "idle += CELLS;"),
     ("cells-before-base", "close closes the cells before the base word",
-     "int idle = admission.getAndAdd(CLOSING) == 0 ? 1 : 0;\n                for (int cell = 1; cell <= CELLS; cell++) if (table.getAndAdd(cell * STRIDE, CLOSING) == 0) idle++;",
-     "int idle = 0;\n                for (int cell = 1; cell <= CELLS; cell++) if (table.getAndAdd(cell * STRIDE, CLOSING) == 0) idle++;\n                if (admission.getAndAdd(CLOSING) == 0) idle++;"),
-    ("cell-skips-base-check", "a cell admission does not check the base word first",
-     "        if (admission.get() < 0) throw stale();\n        @SuppressWarnings", "        @SuppressWarnings"),
+     "int idle = (admission.getAndAdd(CLOSING) & COUNT) == 0 ? 1 : 0;\n                for (int cell = 1; cell <= CELLS; cell++) if (table.getAndAdd(cell * STRIDE, CLOSING) == 0) idle++;",
+     "int idle = 0;\n                for (int cell = 1; cell <= CELLS; cell++) if (table.getAndAdd(cell * STRIDE, CLOSING) == 0) idle++;\n                if ((admission.getAndAdd(CLOSING) & COUNT) == 0) idle++;"),
+    ("cell-skips-base-check", "a call on an inflated scope goes to its cell without checking the base word's CLOSING bit",
+     "            if (value < 0) throw stale();\n            if ((value & INFLATED) != 0) return admitCell(cells);",
+     "            if ((value & INFLATED) != 0) return admitCell(cells);\n            if (value < 0) throw stale();"),
     ("no-close-share", "the hand-off counter omits close's own share",
      "table.lazySet(PENDING, CELLS + 2);", "table.lazySet(PENDING, CELLS + 1);"),
     ("pending-after-closing", "the hand-off counter is initialized after the CLOSING bits are set",
@@ -49,8 +50,15 @@ MUTATIONS = [
      "int value = word == BASE ? admission.decrementAndGet() : cells.decrementAndGet(word * STRIDE);",
      "int value = admission.decrementAndGet();"),
     ("inflate-without-lock", "cells are created without the scope lock and state check",
-     "synchronized (lock) { if (cells == null && state == State.OPEN) cells = new AtomicIntegerArray((CELLS + 2) * STRIDE); }",
-     "if (cells == null) { Thread.yield(); cells = new AtomicIntegerArray((CELLS + 2) * STRIDE); }"),
+     "            if (cells == null && state == State.OPEN) { cells = new AtomicIntegerArray((CELLS + 2) * STRIDE); admission.getAndAdd(INFLATED); }",
+     "            if (cells == null) { Thread.yield(); cells = new AtomicIntegerArray((CELLS + 2) * STRIDE); admission.getAndAdd(INFLATED); }"),
+    ("inflate-without-lock-unlocked", "(companion edit of inflate-without-lock)",
+     "        synchronized (lock) {\n            // cells is written", "        {\n            // cells is written"),
+    ("inflated-before-cells", "INFLATED is set before the cells are published",
+     "{ cells = new AtomicIntegerArray((CELLS + 2) * STRIDE); admission.getAndAdd(INFLATED); }",
+     "{ admission.getAndAdd(INFLATED); Thread.yield(); cells = new AtomicIntegerArray((CELLS + 2) * STRIDE); }"),
+    ("release-exact-closing", "a release drains only on exactly CLOSING, ignoring the base word's INFLATED bit",
+     "if (value < 0 && (value & COUNT) == 0) drained();", "if (value == CLOSING) drained();"),
     ("idle-shortcut-always", "close always treats the hand-off as its own",
      "drained = idle == CELLS + 1 || table.addAndGet(PENDING, -(idle + 1)) == 0;", "drained = true;"),
     ("memo-survives-put", "a cache put keeps the most-recent memo (no longer the LRU tail)",
@@ -69,13 +77,16 @@ MUTATIONS = [
     ("type-cache-unbounded", "the type cache ignores the scope capacity",
      "        if (loadedTypes >= schemaCapacity) return;\n", "", RESOLVER),
     ("table-memo-survives-clear", "clear keeps the member-table memo",
-     "tableMembers = 0; lastTable = null; }", "tableMembers = 0; }", RESOLVER),
+     "tableMembers = 0; lastTable = null; loaded = null;", "tableMembers = 0; loaded = null;", RESOLVER),
+    ("type-cache-survives-clear", "clear keeps the exact-descriptor type cache",
+     "lastTable = null; loaded = null; loadedTypes = 0; }", "lastTable = null; }", RESOLVER),
 ]
 
 # Mutations applied together under one id.
 GROUPS = {"pending-after-closing": ["pending-after-closing", "pending-after-closing-placed"],
-          "type-cache-ignores-loader": ["type-cache-ignores-loader", "type-cache-ignores-loader-put"]}
-HIDDEN = {"pending-after-closing-placed", "type-cache-ignores-loader-put"}
+          "type-cache-ignores-loader": ["type-cache-ignores-loader", "type-cache-ignores-loader-put"],
+          "inflate-without-lock": ["inflate-without-lock", "inflate-without-lock-unlocked"]}
+HIDDEN = {"pending-after-closing-placed", "type-cache-ignores-loader-put", "inflate-without-lock-unlocked"}
 
 
 def run(command, cwd, timeout):
