@@ -36,6 +36,7 @@ public final class CoreContractTest {
         providerArityContracts();
         concurrencyContracts();
         scopeFastPathContracts();
+        memberTableContracts();
         if (args.length > 0) {
             Path output = Path.of(args[0]); Files.createDirectories(output.toAbsolutePath().getParent());
             Files.writeString(output, "<?xml version=\"1.0\" encoding=\"UTF-8\"?><testsuite name=\"MeguvizRef.CoreContracts\" tests=\"" + count + "\" failures=\"" + failures + "\">" + String.join("", xml) + "</testsuite>");
@@ -933,6 +934,99 @@ public final class CoreContractTest {
             scope.close(); for (long value : scope.diagnostics().values()) eq(0L, value);
             CodeScope unused = CodeScope.open(LOADER); unused.advanceCodeEpoch("never resolved"); eq(1L, unused.codeEpoch()); unused.close(); eq(CodeScope.State.CLOSED, unused.state());
         });
+    }
+    private static void memberTableContracts() {
+        test("member-table-cache-structural-results-identical-to-fresh-scopes", () -> {
+            List<QuerySpec> queries = new ArrayList<>();
+            for (Class<?> owner : new Class<?>[]{Target.class, Child.class, ArityFixture.class})
+                for (MemberKind kind : MemberKind.values())
+                    for (Hierarchy hierarchy : Hierarchy.values())
+                        for (Selection selection : new Selection[]{Selection.UNIQUE, Selection.FIRST, Selection.ALL})
+                            for (String name : new String[]{null, "pick", "shadow", "choose", "hashCode", "<init>", "first", "covariant"}) {
+                                if (kind == MemberKind.CONSTRUCTOR && hierarchy != Hierarchy.DECLARED) continue;
+                                QuerySpec.Builder builder = QuerySpec.builder(owner, kind).hierarchy(hierarchy).selection(selection);
+                                if (name != null) builder.name(name);
+                                queries.add(builder.build());
+                                queries.add(builder.parameterCount(1).build());
+                            }
+            try (CodeScope shared = CodeScope.open(LOADER)) {
+                for (int pass = 0; pass < 2; pass++) for (QuerySpec query : queries) {
+                    try (CodeScope fresh = CodeScope.open(LOADER)) {
+                        ResolutionResult expected = fresh.resolve(query), actual = shared.resolve(query);
+                        String label = query.summary();
+                        eq(expected.status(), actual.status()); eq(expected.receipt().reason(), actual.receipt().reason());
+                        eq(expected.receipt().coverage().complete(), actual.receipt().coverage().complete());
+                        eq(expected.receipt().coverage().inspected(), actual.receipt().coverage().inspected());
+                        eq(expected.receipt().descriptors(), actual.receipt().descriptors());
+                        eq(expected.members().size(), actual.members().size());
+                        for (int i = 0; i < expected.members().size(); i++) check(fresh.exportRaw(expected.members().get(i)).equals(shared.exportRaw(actual.members().get(i))), "same member order: " + label);
+                    }
+                }
+                check(memberTables(shared) > 0, "tables retained in shared scope");
+            }
+        });
+        test("member-table-cache-first-keeps-reflection-order", () -> {
+            List<Method> expected = new ArrayList<>(); for (Method m : Target.class.getDeclaredMethods()) if (m.getName().equals("pick")) expected.add(m);
+            try (CodeScope scope = CodeScope.open(LOADER)) {
+                scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").build()).requireSingle();
+                eq(Target.class.getDeclaredMethods().length, memberTables(scope));
+                eq(expected.get(0), scope.exportRaw(scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").selection(Selection.FIRST).build()).requireSingle()));
+                ResolutionResult all = scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").selection(Selection.ALL).build());
+                for (int i = 0; i < expected.size(); i++) eq(expected.get(i), scope.exportRaw(all.members().get(i)));
+                eq(Target.class.getDeclaredMethods().length, memberTables(scope));
+            }
+        });
+        test("member-table-cache-bounded-by-capacity-lru", () -> {
+            int target = Target.class.getDeclaredMethods().length, arity = ArityFixture.class.getDeclaredMethods().length, child = Child.class.getDeclaredMethods().length;
+            try (CodeScope small = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, target - 1)) {
+                small.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").build()).requireSingle(); eq(0, memberTables(small));
+                small.resolve(QuerySpec.builder(Child.class, MemberKind.METHOD).name("covariant").bridge(false).build()).requireSingle(); eq(child, memberTables(small));
+            }
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, target + arity)) {
+                scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").selection(Selection.ALL).build()); eq(target, memberTables(scope));
+                scope.resolve(QuerySpec.builder(ArityFixture.class, MemberKind.METHOD).name("choose").parameterCount(0).build()).requireSingle(); eq(target + arity, memberTables(scope));
+                scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("one").build()).requireSingle(); // touch: Target becomes most recent
+                scope.resolve(QuerySpec.builder(Child.class, MemberKind.METHOD).name("covariant").bridge(false).build()).requireSingle();
+                eq(target + child, memberTables(scope)); // eldest ArityFixture table evicted
+                scope.resolve(QuerySpec.builder(EmptyTarget.class, MemberKind.FIELD).build());
+                check(memberTables(scope) <= target + arity, "bounded");
+            }
+        });
+        test("member-table-cache-cleared-by-epoch-and-close", () -> {
+            CodeScope scope = CodeScope.open(LOADER);
+            scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").build()).requireSingle(); check(memberTables(scope) > 0, "retained");
+            scope.advanceCodeEpoch("tables"); eq(0, memberTables(scope));
+            scope.resolve(QuerySpec.builder(Target.class, MemberKind.FIELD).name("number").build()).requireSingle(); eq(Target.class.getDeclaredFields().length, memberTables(scope));
+            scope.close(); eq(0, memberTables(scope));
+        });
+        test("member-table-cache-no-negative-caching-of-failed-enumeration", () -> {
+            try (URLClassLoader loader = isolated(missing); CodeScope scope = CodeScope.open(loader)) {
+                QuerySpec query = QuerySpec.builder("fixture.MissingSignatureFixture", MemberKind.METHOD).name("available").build();
+                for (int i = 0; i < 3; i++) { ResolutionResult result = scope.resolve(query); eq(ResolutionStatus.PARTIAL, result.status()); check(!result.receipt().coverage().complete(), "unknown signature"); }
+                eq(0, memberTables(scope));
+            }
+        });
+        test("member-table-cache-concurrent-different-queries-same-owner", () -> {
+            ExecutorService executor = Executors.newFixedThreadPool(4);
+            try (CodeScope scope = CodeScope.open(LOADER)) {
+                List<Callable<Method>> work = new ArrayList<>();
+                String[] names = {"zero", "one", "four", "eight", "wide", "varargs", "nullable", "throwOnce"};
+                for (int round = 0; round < 8; round++) for (String name : names) {
+                    QuerySpec query = QuerySpec.builder(Target.class, MemberKind.METHOD).name(name).candidateBudget(1000 + round).build();
+                    work.add(() -> (Method) scope.exportRaw(scope.resolve(query).requireSingle()));
+                }
+                List<Future<Method>> results = executor.invokeAll(work);
+                for (int i = 0; i < results.size(); i++) eq(names[i % names.length], results.get(i).get(3, TimeUnit.SECONDS).getName());
+                eq(Target.class.getDeclaredMethods().length, memberTables(scope));
+                eq((long) names.length, scope.diagnostics().get("bindings"));
+            } finally { executor.shutdownNow(); }
+        });
+    }
+    private static int memberTables(CodeScope scope) throws ReflectiveOperationException {
+        Field field = CodeScope.class.getDeclaredField("resolver"); field.setAccessible(true);
+        Object resolver = field.get(scope); if (resolver == null) return 0;
+        Field members = ReflectionResolver.class.getDeclaredField("tableMembers"); members.setAccessible(true);
+        synchronized (resolver) { return members.getInt(resolver); }
     }
     private static int cycle(QueryCoordinator<String,Integer> coordinator, String dependency, CyclicBarrier barrier) {
         try { barrier.await(2,TimeUnit.SECONDS); return coordinator.execute(dependency, () -> 0,1000); } catch (InterruptedException | TimeoutException | BrokenBarrierException e) { throw new AssertionError(e); }
