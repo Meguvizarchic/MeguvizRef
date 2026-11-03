@@ -35,6 +35,13 @@ public final class CodeScope implements AutoCloseable {
     private long codeEpoch, nextSlot = 1, cacheHits;
     private boolean resolved;
     private final Map<QuerySpec, ResolutionResult> cache = new LinkedHashMap<>(16, .75f, true);
+    /**
+     * Lock-free view of the cache's most recently used entry. Updated under the lock at every cache hit and put and
+     * cleared with the cache, so it is always the LRU tail and serving it leaves the eviction order unchanged.
+     */
+    private volatile Recent recent;
+    /** Hits served from {@link #recent}, created with the first memo; diagnostics add its sum to cacheHits. */
+    private LongAdder recentHits;
     private final Map<Member, Slot> memberSlots = new HashMap<>();
     /** Current identity, epoch and append-only slot table; replaced under the lock, read lock-free by plan calls. */
     private volatile Bindings bindings;
@@ -80,12 +87,15 @@ public final class CodeScope implements AutoCloseable {
     }
     public ResolutionResult resolve(QuerySpec query) {
         Objects.requireNonNull(query);
+        // A non-null memo was read before close/epoch cleared it, so this hit is ordered before that change.
+        Recent last = recent;
+        if (last != null && last.matches(query) && !Thread.currentThread().isInterrupted()) { last.hits.increment(); return last.result; }
         Context context;
         synchronized (lock) {
             if (state != State.OPEN) return failure(query, ResolutionStatus.STALE, "scope_closed");
             if (Thread.currentThread().isInterrupted()) return failure(query, ResolutionStatus.CANCELLED, "interrupted");
             resolved = true;
-            ResolutionResult cached = cache.get(query);
+            ResolutionResult cached = cached(query);
             if (cached != null) { cacheHits++; return cached; }
             admission.incrementAndGet(); // OPEN under the lock, so CLOSING cannot be set concurrently
             context = context();
@@ -107,7 +117,7 @@ public final class CodeScope implements AutoCloseable {
             if (state != State.OPEN) return RawResolution.failed(failure(query, ResolutionStatus.STALE, "scope_closed"));
             if (Thread.currentThread().isInterrupted()) return RawResolution.failed(failure(query, ResolutionStatus.CANCELLED, "interrupted"));
             resolved = true;
-            ResolutionResult cached = cache.get(query);
+            ResolutionResult cached = cached(query);
             admission.incrementAndGet(); // access preparation below still counts as in-flight work
             if (cached != null) { cacheHits++; hit = raw(cached); } else context = context();
         }
@@ -153,7 +163,7 @@ public final class CodeScope implements AutoCloseable {
     private RawResolution resolveUncachedRaw(QuerySpec query, Context context) {
         synchronized (lock) {
             if (!current(context)) return RawResolution.failed(failure(query, ResolutionStatus.STALE, "scope_invalidated"));
-            ResolutionResult cached = cache.get(query);
+            ResolutionResult cached = cached(query);
             if (cached != null) { cacheHits++; return raw(cached); }
         }
         ReflectionResolver.Outcome outcome = context.resolver.resolve(query, context.loader, context.providers, context.codeFingerprint);
@@ -169,7 +179,7 @@ public final class CodeScope implements AutoCloseable {
     private ResolutionResult resolveUncached(QuerySpec query, Context context) {
         synchronized (lock) {
             if (!current(context)) return failure(query, ResolutionStatus.STALE, "scope_invalidated");
-            ResolutionResult cached = cache.get(query);
+            ResolutionResult cached = cached(query);
             if (cached != null) { cacheHits++; return cached; }
         }
         ReflectionResolver.Outcome outcome = context.resolver.resolve(query, context.loader, context.providers, context.codeFingerprint);
@@ -197,11 +207,21 @@ public final class CodeScope implements AutoCloseable {
             ResolutionReceipt receipt = new ResolutionReceipt(query.summary(), query.selection(), outcome.status, outcome.coverage, descriptors, outcome.reason, outcome.cause);
             ResolutionResult result = new ResolutionResult(outcome.status, members, receipt);
             if (outcome.coverage.complete() && (outcome.status == ResolutionStatus.RESOLVED || outcome.status == ResolutionStatus.ALL_MATCHES)) {
-                cache.put(query, result);
+                cache.put(query, result); remember(query, result);
                 if (cache.size() > capacity) cache.remove(cache.keySet().iterator().next());
             }
             return result;
         }
+    }
+    /** Caller holds the lock. Every access-ordered hit moves the entry to the tail, so the memo follows it. */
+    private ResolutionResult cached(QuerySpec query) {
+        ResolutionResult cached = cache.get(query);
+        if (cached != null) { Recent last = recent; if (last == null || last.result != cached) remember(query, cached); }
+        return cached;
+    }
+    private void remember(QuerySpec query, ResolutionResult result) {
+        if (recentHits == null) recentHits = new LongAdder();
+        recent = new Recent(query, result, recentHits);
     }
     private boolean current(Context context) { return state == State.OPEN && identity.equals(context.identity) && codeEpoch == context.epoch; }
     private static ResolutionResult failure(QuerySpec query, ResolutionStatus status, String reason) {
@@ -272,7 +292,7 @@ public final class CodeScope implements AutoCloseable {
         synchronized (lock) {
             if (state != State.OPEN) throw new StalePlanException("scope closed");
             if (codeEpoch == Long.MAX_VALUE) { identity = newIdentity(); codeEpoch = 0; } else codeEpoch++;
-            cache.clear(); memberSlots.clear(); bindings = new Bindings(identity, codeEpoch, nextSlot, capacity);
+            cache.clear(); if (recent != null) recent = null; memberSlots.clear(); bindings = new Bindings(identity, codeEpoch, nextSlot, capacity);
             if (resolver != null) resolver.clear();
             resolver = null; codeFingerprint = null;
             oldCoordinator = coordinator; coordinator = null;
@@ -282,7 +302,7 @@ public final class CodeScope implements AutoCloseable {
     public Map<String, Long> diagnostics() {
         synchronized (lock) {
             Map<String, Long> values = new LinkedHashMap<>();
-            values.put("cacheHits", cacheHits); values.put("cachedQueries", (long) cache.size()); values.put("bindings", (long) bindings.size);
+            values.put("cacheHits", cacheHits + (recentHits == null ? 0 : recentHits.sum())); values.put("cachedQueries", (long) cache.size()); values.put("bindings", (long) bindings.size);
             values.put("schemas", resolver == null ? 0L : (long) resolver.schemaSize()); values.put("parameterReads", resolver == null ? 0L : resolver.parameterReads());
             values.put("candidateChecks", resolver == null ? 0L : resolver.candidateChecks()); values.put("lookups", resolver == null ? 0L : resolver.lookups());
             values.put("inFlight", (long) (admission.get() & Integer.MAX_VALUE));
@@ -295,7 +315,7 @@ public final class CodeScope implements AutoCloseable {
         synchronized (lock) {
             if (state != State.OPEN) return;
             int inFlight = admission.getAndAdd(CLOSING); // linearization point; OPEN implies CLOSING was clear
-            state = State.RETIRING; loader = null; bindings = Bindings.CLOSED; cache.clear(); memberSlots.clear(); codeFingerprint = null;
+            state = State.RETIRING; loader = null; bindings = Bindings.CLOSED; cache.clear(); if (recent != null) recent = null; memberSlots.clear(); codeFingerprint = null;
             if (resolver != null) resolver.clear();
             previous = coordinator;
             if (inFlight == 0) { state = State.CLOSED; retired = providers; providers = null; }
@@ -366,6 +386,13 @@ public final class CodeScope implements AutoCloseable {
             if (descriptor != slot.descriptor && !descriptor.equals(slot.descriptor)) throw new StalePlanException("binding descriptor mismatch");
             return slot;
         }
+    }
+    private static final class Recent {
+        final QuerySpec query;
+        final ResolutionResult result;
+        final LongAdder hits;
+        Recent(QuerySpec query, ResolutionResult result, LongAdder hits) { this.query = query; this.result = result; this.hits = hits; }
+        boolean matches(QuerySpec candidate) { return candidate == query || (candidate.hashCode() == query.hashCode() && candidate.equals(query)); }
     }
     /** Single-flight key for resolveRaw, distinct from the token flight of an equal query. */
     private static final class RawKey {

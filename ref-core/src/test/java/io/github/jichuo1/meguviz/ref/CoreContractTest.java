@@ -38,6 +38,7 @@ public final class CoreContractTest {
         concurrencyContracts();
         scopeFastPathContracts();
         memberTableContracts();
+        recentHitContracts();
         descriptorFastPathContracts();
         apiAdditionContracts();
         if (args.length > 0) {
@@ -844,10 +845,12 @@ public final class CoreContractTest {
                 MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Counting.class.getName(), "run", "I"))).requireSingle());
                 CountDownLatch running = new CountDownLatch(4); List<Thread> workers = new ArrayList<>(); AtomicReference<Throwable> failure = new AtomicReference<>();
                 for (int w = 0; w < 4; w++) {
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
                     Thread worker = new Thread(() -> {
                         boolean first = true;
                         try {
                             for (;;) {
+                                if (System.nanoTime() > deadline) { violations.incrementAndGet(); return; }
                                 boolean late = closeReturned.get(); Counting.ADMITTED.set(false);
                                 try { plan.invoke(counting, new Object[0]); } catch (StalePlanException stale) { if (Counting.ADMITTED.get()) violations.incrementAndGet(); return; }
                                 if (late) violations.incrementAndGet();
@@ -856,7 +859,7 @@ public final class CoreContractTest {
                         } catch (Throwable error) { failure.set(error); }
                         finally { if (first) running.countDown(); }
                     });
-                    workers.add(worker); worker.start();
+                    worker.setDaemon(true); workers.add(worker); worker.start();
                 }
                 await(running); for (int spin = round % 7; spin > 0; spin--) Thread.yield();
                 scope.close(); closeReturned.set(true);
@@ -872,10 +875,12 @@ public final class CoreContractTest {
                     MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Counting.class.getName(), "run", "I"))).requireSingle());
                     CountDownLatch running = new CountDownLatch(3); List<Thread> workers = new ArrayList<>(); AtomicReference<Throwable> failure = new AtomicReference<>();
                     for (int w = 0; w < 3; w++) {
+                        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
                         Thread worker = new Thread(() -> {
                             boolean first = true;
                             try {
                                 for (;;) {
+                                    if (System.nanoTime() > deadline) { violations.incrementAndGet(); return; }
                                     boolean late = advanced.get();
                                     try { plan.invoke(counting, new Object[0]); } catch (StalePlanException stale) { return; }
                                     if (late) violations.incrementAndGet();
@@ -884,7 +889,7 @@ public final class CoreContractTest {
                             } catch (Throwable error) { failure.set(error); }
                             finally { if (first) running.countDown(); }
                         });
-                        workers.add(worker); worker.start();
+                        worker.setDaemon(true); workers.add(worker); worker.start();
                     }
                     await(running); scope.advanceCodeEpoch("race"); advanced.set(true);
                     for (Thread worker : workers) { worker.join(3000); check(!worker.isAlive(), "worker stopped after epoch"); }
@@ -936,6 +941,63 @@ public final class CoreContractTest {
             scope.advanceCodeEpoch("lazy"); eq(keys, new ArrayList<>(scope.diagnostics().keySet())); for (long value : scope.diagnostics().values()) eq(0L, value);
             scope.close(); for (long value : scope.diagnostics().values()) eq(0L, value);
             CodeScope unused = CodeScope.open(LOADER); unused.advanceCodeEpoch("never resolved"); eq(1L, unused.codeEpoch()); unused.close(); eq(CodeScope.State.CLOSED, unused.state());
+        });
+    }
+    private static void recentHitContracts() {
+        test("recent-hit-memo-counts-and-keeps-lru", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 2)) {
+                QuerySpec a = QuerySpec.method(Target.class, "zero"), b = QuerySpec.method(Target.class, "one", int.class), c = QuerySpec.exact(descriptor("zero", "I")); // same member as a: no new binding
+                ResolutionResult ra = scope.resolve(a), rb = scope.resolve(b);
+                for (int i = 0; i < 5; i++) { check(scope.resolve(b) == rb, "memo hit"); check(scope.resolve(QuerySpec.method(Target.class, "one", int.class)) == rb, "equal query hit"); }
+                eq(10L, scope.diagnostics().get("cacheHits"));
+                check(scope.resolve(a) == ra, "older entry hit"); eq(11L, scope.diagnostics().get("cacheHits"));
+                eq(ResolutionStatus.RESOLVED, scope.resolve(c).status()); eq(2L, scope.diagnostics().get("cachedQueries")); eq(2L, scope.diagnostics().get("bindings")); // evicts b, the least recently used
+                long lookups = scope.diagnostics().get("lookups"); scope.resolve(b); eq(lookups + 1, scope.diagnostics().get("lookups"));
+                check(scope.resolve(QuerySpec.method(Target.class, "one", int.class)).members().get(0).slot() == rb.members().get(0).slot(), "same binding after re-resolve");
+            }
+        });
+        test("recent-hit-memo-follows-lru-tail", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 2)) {
+                QuerySpec a = QuerySpec.method(Target.class, "zero"), b = QuerySpec.method(Target.class, "one", int.class), c = QuerySpec.exact(descriptor("zero", "I"));
+                ResolutionResult ra = scope.resolve(a), rb = scope.resolve(b);
+                check(scope.resolve(a) == ra, "a hit"); check(scope.resolve(b) == rb, "b hit"); check(scope.resolve(b) == rb, "b memo hit");
+                eq(ResolutionStatus.RESOLVED, scope.resolve(c).status()); // evicts a: b was used after a
+                long lookups = scope.diagnostics().get("lookups");
+                check(scope.resolve(b) == rb, "b still cached"); eq(lookups, scope.diagnostics().get("lookups"));
+                scope.resolve(a); eq(lookups + 1, scope.diagnostics().get("lookups"));
+            }
+        });
+        test("recent-hit-memo-interrupt-closed-and-epoch", () -> {
+            CodeScope scope = CodeScope.open(LOADER); QuerySpec query = QuerySpec.method(Target.class, "zero"); ResolutionResult first = scope.resolve(query);
+            check(scope.resolve(query) == first, "memo");
+            try { Thread.currentThread().interrupt(); eq(ResolutionStatus.CANCELLED, scope.resolve(query).status()); check(Thread.currentThread().isInterrupted(), "flag kept"); } finally { Thread.interrupted(); }
+            scope.advanceCodeEpoch("memo"); ResolutionResult second = scope.resolve(query); check(second != first, "epoch cleared memo"); eq(1L, second.members().get(0).codeEpoch());
+            scope.close(); ResolutionResult stale = scope.resolve(query); eq(ResolutionStatus.STALE, stale.status()); eq("scope_closed", stale.receipt().reason());
+        });
+        test("recent-hit-memo-close-race", () -> {
+            for (int round = 0; round < 100; round++) {
+                CodeScope scope = CodeScope.open(LOADER); QuerySpec query = QuerySpec.method(Target.class, "zero"); ResolutionResult cached = scope.resolve(query);
+                AtomicBoolean closed = new AtomicBoolean(); AtomicInteger violations = new AtomicInteger(); AtomicLong hits = new AtomicLong();
+                CountDownLatch running = new CountDownLatch(4); List<Thread> workers = new ArrayList<>();
+                for (int w = 0; w < 4; w++) {
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                    Thread worker = new Thread(() -> {
+                        boolean first = true;
+                        for (;;) {
+                            if (System.nanoTime() > deadline) { violations.incrementAndGet(); if (first) running.countDown(); return; }
+                            boolean late = closed.get(); ResolutionResult result = scope.resolve(query);
+                            if (result == cached) { hits.incrementAndGet(); if (late) violations.incrementAndGet(); }
+                            else if (result.status() == ResolutionStatus.STALE) { if (first) running.countDown(); return; }
+                            else violations.incrementAndGet();
+                            if (first) { first = false; running.countDown(); }
+                        }
+                    });
+                    worker.setDaemon(true); workers.add(worker); worker.start();
+                }
+                await(running); scope.close(); closed.set(true);
+                for (Thread worker : workers) { worker.join(3000); check(!worker.isAlive(), "worker stopped"); }
+                eq(0, violations.get()); eq(hits.get(), scope.diagnostics().get("cacheHits"));
+            }
         });
     }
     private static void memberTableContracts() {
