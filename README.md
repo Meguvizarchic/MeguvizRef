@@ -59,6 +59,23 @@ dependencies {
 
 ## 💡 使用示例
 
+**最短路径**（1.1.0 起，当前为开发版）：按 `Class` 查询，一步绑定，可变参数调用。
+
+```java
+import io.github.jichuo1.meguviz.ref.api.query.QuerySpec;
+import io.github.jichuo1.meguviz.ref.runtime.invoke.MethodPlan;
+import io.github.jichuo1.meguviz.ref.scope.CodeScope;
+
+try (CodeScope scope = CodeScope.open(String.class.getClassLoader())) {
+    MethodPlan substring = scope.bindMethod(QuerySpec.method(String.class, "substring", int.class));
+    Object value = substring.call("hello", 2); // "llo"
+}
+```
+
+查询默认要求唯一匹配，否则抛出带状态和原因的 `ResolutionException`。非公开成员使用 `CodeScope.open(loader, AccessPolicy.TRY_SUPPRESS_JAVA_CHECKS)`。
+
+**可移植精确描述符**（1.0.0 起）：
+
 ```java
 import io.github.jichuo1.meguviz.ref.api.descriptor.MemberDescriptor;
 import io.github.jichuo1.meguviz.ref.api.query.QuerySpec;
@@ -92,6 +109,7 @@ try (CodeScope scope = CodeScope.open(String.class.getClassLoader())) {
 | [文档目录](docs/README.md) | 全部文档入口 |
 | [核心 API](docs/api/core-contracts.md) | 核心合同与语义 |
 | [构建与验证](docs/development.md) | 本地构建、测试与验证流程 |
+| [性能说明](docs/performance.md) | 性能改动依据与主机基准（非设备数据） |
 | [1.0.0 发布说明](docs/releases/1.0.0.md) | 版本内容与变更 |
 
 ## 📄 许可证

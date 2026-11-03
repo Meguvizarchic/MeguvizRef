@@ -19,7 +19,12 @@ bash gradlew -Pmeguviz.profile=android verifyHost verifyAndroid --build-cache --
 
 # 验证后生成三个模块的 Maven 制品、源码包及校验和
 bash gradlew -Pmeguviz.profile=android packageRelease --build-cache --no-daemon
+
+# 主机 JMH 微基准（默认不纳入构建，不发布，不属于 verifyHost）
+bash gradlew -Pmeguviz.benchmarks=true :benchmark-jvm:jmh -Pjmh.include=InvokeBenchmark "-Pjmh.args=-f 2 -wi 3 -i 5 -w 1s -r 1s -prof gc"
 ```
+
+基准结果只代表主机 JDK，说明与历史数据见[性能说明](performance.md)。
 
 Windows 使用 `gradlew.bat` 替换 `bash gradlew`；PowerShell 中带点号的 `-P` 参数应整体加引号，例如 `'-Pmeguviz.profile=android'`。
 

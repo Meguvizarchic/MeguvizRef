@@ -6,7 +6,7 @@ ProviderRegistry 是不可变安装快照，只能转交一个 scope，且在首
 
 CandidateBatch 只传描述符、代码指纹和候选域；scope 必须已有 STRONG CodeIdentity，并将每个候选重新绑定当前 loader、验证完整类型和请求域。字段/方法 raw 成员不从 Provider 输入接受。错误指纹为 STALE；候选解析失败、候选不在域内为 PARTIAL。
 
-Provider 的 complete=true 只是声明。对本次已支持的结构约束，ProviderCoverageVerifier 以独立直接反射循环重放实际 Java 可见域，核对满足约束的完整 Member 集合；没有证明时仍为 PARTIAL。complete=false 不会被升级。这个冷路径复核有额外枚举成本，因此不将 Provider 冷查询当作性能优化。隐藏过滤仍只代表 Java 可见宇宙。
+Provider 的 complete=true 只是声明。对本次已支持的结构约束，ProviderCoverageVerifier 以独立直接反射循环重放实际 Java 可见域，核对满足约束的完整 Member 集合；没有证明时仍为 PARTIAL。complete=false 不会被升级。这个冷路径复核有额外枚举成本，因此不将 Provider 冷查询当作性能优化；结构查询的作用域成员表缓存不用于该复核，也不用于 Provider 候选域。隐藏过滤仍只代表 Java 可见宇宙。
 
 候选的声明类必须属于实际查询域；对于 `JAVA_PUBLIC`，还必须是 `getMethods()` 或 `getFields()` 实际返回的成员，不能仅凭声明类是 owner 的父类型就认定可见。若作用域加载器遮蔽了继承声明类，同名候选只在真实查询域中能唯一确认其类和成员身份时恢复；存在歧义或无法验证时保持不完整。
 

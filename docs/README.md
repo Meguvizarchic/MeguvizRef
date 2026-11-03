@@ -9,6 +9,7 @@
 | [解析证据与代码身份](api/evidence-schema.md) | 诊断收据、代码摘要和独立复验 |
 | [持久化](api/persistence.md) | 存储格式、容量限制和恢复校验 |
 | [Provider SPI](api/spi-versioning.md) | Provider 注册、候选覆盖与生命周期 |
+| [性能说明](performance.md) | 1.1.0 开发版的性能改动、依据与主机基准 |
 
 ## 开发与版本
 
@@ -18,5 +19,6 @@
 | [发布到 Maven Central](publishing-central.md) | 命名空间验证、签名与上传步骤 |
 | [兼容性](api/version-policy.md) | API、SPI、持久化格式及二进制兼容检查 |
 | [1.0.0 发布说明](releases/1.0.0.md) | 版本功能、验证范围和下载内容 |
+| [1.1.0 发布说明草稿](releases/1.1.0.md) | 未发布：新增 API、性能改动与升级提示 |
 
 [返回项目首页](../README.md)
