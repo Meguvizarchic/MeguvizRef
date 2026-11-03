@@ -35,6 +35,7 @@ public final class CoreContractTest {
         providerContracts();
         providerArityContracts();
         concurrencyContracts();
+        scopeFastPathContracts();
         if (args.length > 0) {
             Path output = Path.of(args[0]); Files.createDirectories(output.toAbsolutePath().getParent());
             Files.writeString(output, "<?xml version=\"1.0\" encoding=\"UTF-8\"?><testsuite name=\"MeguvizRef.CoreContracts\" tests=\"" + count + "\" failures=\"" + failures + "\">" + String.join("", xml) + "</testsuite>");
@@ -805,6 +806,134 @@ public final class CoreContractTest {
             check(caught == original, "fatal cleanup propagates during target invocation"); eq(1, provider.closes.get()); eq(CodeScope.State.CLOSED, scope.state());
         });
     }
+    private static void scopeFastPathContracts() {
+        test("lock-free-admission-close-drains-admitted-calls-before-provider-close", () -> {
+            Provider provider = new Provider("p", ""); CodeScope scope = providerScope(provider); ExecutorService executor = Executors.newFixedThreadPool(3);
+            Blocking[] targets = {new Blocking(), new Blocking(), new Blocking()};
+            try {
+                MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Blocking.class.getName(), "run", "I"))).requireSingle());
+                List<Future<Object>> calls = new ArrayList<>();
+                for (Blocking target : targets) { calls.add(executor.submit(() -> plan.invoke(target, new Object[0]))); await(target.entered); }
+                eq(3L, scope.diagnostics().get("inFlight"));
+                scope.close(); eq(CodeScope.State.RETIRING, scope.state()); eq(0, provider.closes.get());
+                Blocking late = new Blocking(); late.exit.countDown();
+                eq("scope identity or epoch is stale", expect(StalePlanException.class, () -> plan.invoke(late, new Object[0])).getMessage());
+                eq(1L, late.entered.getCount()); eq(3L, scope.diagnostics().get("inFlight"));
+                targets[0].exit.countDown(); eq(1, calls.get(0).get(3, TimeUnit.SECONDS));
+                targets[1].exit.countDown(); eq(1, calls.get(1).get(3, TimeUnit.SECONDS));
+                eq(0, provider.closes.get()); eq(CodeScope.State.RETIRING, scope.state()); eq(1L, scope.diagnostics().get("inFlight"));
+                targets[2].exit.countDown(); eq(1, calls.get(2).get(3, TimeUnit.SECONDS));
+                eq(1, provider.closes.get()); eq(CodeScope.State.CLOSED, scope.state()); eq(0L, scope.diagnostics().get("inFlight"));
+                scope.close(); eq(1, provider.closes.get());
+            } finally { for (Blocking target : targets) target.exit.countDown(); scope.close(); executor.shutdownNow(); }
+        });
+        test("lock-free-admission-close-race-stress", () -> {
+            Thread main = Thread.currentThread();
+            for (int round = 0; round < 150; round++) {
+                Provider provider = new Provider("p", ""); CodeScope scope = providerScope(provider); Counting counting = new Counting();
+                AtomicInteger violations = new AtomicInteger(); AtomicBoolean closeReturned = new AtomicBoolean();
+                provider.onClose = () -> {
+                    if (counting.inFlight.get() != 0) violations.incrementAndGet();
+                    if (Thread.currentThread() != main && !Counting.ADMITTED.get()) violations.incrementAndGet();
+                    counting.providerClosed.set(true);
+                };
+                MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Counting.class.getName(), "run", "I"))).requireSingle());
+                CountDownLatch running = new CountDownLatch(4); List<Thread> workers = new ArrayList<>(); AtomicReference<Throwable> failure = new AtomicReference<>();
+                for (int w = 0; w < 4; w++) {
+                    Thread worker = new Thread(() -> {
+                        boolean first = true;
+                        try {
+                            for (;;) {
+                                boolean late = closeReturned.get(); Counting.ADMITTED.set(false);
+                                try { plan.invoke(counting, new Object[0]); } catch (StalePlanException stale) { if (Counting.ADMITTED.get()) violations.incrementAndGet(); return; }
+                                if (late) violations.incrementAndGet();
+                                if (first) { first = false; running.countDown(); }
+                            }
+                        } catch (Throwable error) { failure.set(error); }
+                        finally { if (first) running.countDown(); }
+                    });
+                    workers.add(worker); worker.start();
+                }
+                await(running); for (int spin = round % 7; spin > 0; spin--) Thread.yield();
+                scope.close(); closeReturned.set(true);
+                for (Thread worker : workers) { worker.join(3000); check(!worker.isAlive(), "worker stopped after close"); }
+                eq(null, failure.get()); eq(0, violations.get()); eq(0, counting.enteredAfterProviderClose.get());
+                eq(1, provider.closes.get()); eq(CodeScope.State.CLOSED, scope.state()); eq(0L, scope.diagnostics().get("inFlight"));
+            }
+        });
+        test("lock-free-admission-epoch-race", () -> {
+            for (int round = 0; round < 50; round++) {
+                try (CodeScope scope = CodeScope.open(LOADER)) {
+                    Counting counting = new Counting(); AtomicBoolean advanced = new AtomicBoolean(); AtomicInteger violations = new AtomicInteger();
+                    MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Counting.class.getName(), "run", "I"))).requireSingle());
+                    CountDownLatch running = new CountDownLatch(3); List<Thread> workers = new ArrayList<>(); AtomicReference<Throwable> failure = new AtomicReference<>();
+                    for (int w = 0; w < 3; w++) {
+                        Thread worker = new Thread(() -> {
+                            boolean first = true;
+                            try {
+                                for (;;) {
+                                    boolean late = advanced.get();
+                                    try { plan.invoke(counting, new Object[0]); } catch (StalePlanException stale) { return; }
+                                    if (late) violations.incrementAndGet();
+                                    if (first) { first = false; running.countDown(); }
+                                }
+                            } catch (Throwable error) { failure.set(error); }
+                            finally { if (first) running.countDown(); }
+                        });
+                        workers.add(worker); worker.start();
+                    }
+                    await(running); scope.advanceCodeEpoch("race"); advanced.set(true);
+                    for (Thread worker : workers) { worker.join(3000); check(!worker.isAlive(), "worker stopped after epoch"); }
+                    eq(null, failure.get()); eq(0, violations.get()); eq(0L, scope.diagnostics().get("inFlight")); eq(CodeScope.State.OPEN, scope.state());
+                    eq(1, scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Counting.class.getName(), "run", "I"))).requireSingle()).invoke(counting, new Object[0]));
+                }
+            }
+        });
+        test("slot-table-indexing-across-epochs-and-forged-tokens", () -> {
+            CodeScope scope = CodeScope.open(LOADER);
+            try {
+                ResolutionResult all = scope.resolve(QuerySpec.builder(String.class, MemberKind.METHOD).selection(Selection.ALL).build());
+                eq(ResolutionStatus.ALL_MATCHES, all.status()); int n = all.members().size(); check(n > 127, "beyond the small Long cache: " + n);
+                for (int i = 0; i < n; i++) {
+                    ResolvedMember token = all.members().get(i); eq((long) i + 1, token.slot());
+                    eq(token.descriptor(), MemberDescriptor.from(scope.exportRaw(token)));
+                }
+                MethodPlan before = scope.bindMethod(scope.resolve(QuerySpec.exact(descriptor("zero", "I"))).requireSingle()); eq(0, before.invoke(new Target(), new Object[0]));
+                scope.advanceCodeEpoch("slot table");
+                ResolvedMember zero = scope.resolve(QuerySpec.exact(descriptor("zero", "I"))).requireSingle();
+                eq((long) n + 2, zero.slot()); eq(1L, zero.codeEpoch()); eq(0, scope.bindMethod(zero).invoke(new Target(), new Object[0]));
+                eq("scope identity or epoch is stale", expect(StalePlanException.class, () -> before.invoke(new Target(), new Object[0])).getMessage());
+                String id = scope.identity();
+                for (long slot : new long[]{n + 1, n + 3, 0, -1, Long.MAX_VALUE, Long.MIN_VALUE}) {
+                    eq("binding no longer exists", expect(StalePlanException.class, () -> scope.exportRaw(new ResolvedMember(id, 1, slot, zero.descriptor()))).getMessage());
+                }
+                eq("binding descriptor mismatch", expect(StalePlanException.class, () -> scope.exportRaw(new ResolvedMember(id, 1, zero.slot(), descriptor("one", "I", "I")))).getMessage());
+                check(zero.descriptor() != descriptor("zero", "I") && zero.descriptor().equals(descriptor("zero", "I")), "fixture");
+                eq(Target.class.getDeclaredMethod("zero"), scope.exportRaw(new ResolvedMember(new String(id), 1, zero.slot(), descriptor("zero", "I"))));
+                eq("scope identity or epoch is stale", expect(StalePlanException.class, () -> scope.exportRaw(new ResolvedMember(id, 0, zero.slot(), zero.descriptor()))).getMessage());
+                scope.close();
+                eq("scope identity or epoch is stale", expect(StalePlanException.class, () -> scope.exportRaw(zero)).getMessage());
+                eq(0L, scope.diagnostics().get("bindings"));
+            } finally { scope.close(); }
+        });
+        test("scope-identity-unique-uuid-text", () -> {
+            Set<String> identities = new HashSet<>();
+            for (int i = 0; i < 2000; i++) {
+                CodeScope scope = CodeScope.open(LOADER); String id = scope.identity();
+                eq(id, UUID.fromString(id).toString()); identities.add(id); scope.close(); eq(id, scope.identity());
+            }
+            eq(2000, identities.size());
+        });
+        test("lazy-resolver-diagnostics-shape", () -> {
+            List<String> keys = Arrays.asList("cacheHits", "cachedQueries", "bindings", "schemas", "parameterReads", "candidateChecks", "lookups", "inFlight");
+            CodeScope scope = CodeScope.open(LOADER);
+            eq(keys, new ArrayList<>(scope.diagnostics().keySet())); for (long value : scope.diagnostics().values()) eq(0L, value);
+            scope.resolve(QuerySpec.exact(descriptor("zero", "I"))).requireSingle(); eq(1L, scope.diagnostics().get("lookups")); eq(1L, scope.diagnostics().get("bindings"));
+            scope.advanceCodeEpoch("lazy"); eq(keys, new ArrayList<>(scope.diagnostics().keySet())); for (long value : scope.diagnostics().values()) eq(0L, value);
+            scope.close(); for (long value : scope.diagnostics().values()) eq(0L, value);
+            CodeScope unused = CodeScope.open(LOADER); unused.advanceCodeEpoch("never resolved"); eq(1L, unused.codeEpoch()); unused.close(); eq(CodeScope.State.CLOSED, unused.state());
+        });
+    }
     private static int cycle(QueryCoordinator<String,Integer> coordinator, String dependency, CyclicBarrier barrier) {
         try { barrier.await(2,TimeUnit.SECONDS); return coordinator.execute(dependency, () -> 0,1000); } catch (InterruptedException | TimeoutException | BrokenBarrierException e) { throw new AssertionError(e); }
     }
@@ -927,6 +1056,17 @@ public final class CoreContractTest {
     public static final class EmptyTarget { }
     public static class Parent { public int shadow; public Object covariant() { return "parent"; } }
     public static final class Child extends Parent { public String shadow; @Override public String covariant() { return "child"; } }
+    /** Counts entered target calls; ADMITTED marks that the current thread's call reached the target. */
+    public static final class Counting {
+        static final ThreadLocal<Boolean> ADMITTED = ThreadLocal.withInitial(() -> false);
+        final AtomicInteger inFlight = new AtomicInteger(), calls = new AtomicInteger(), enteredAfterProviderClose = new AtomicInteger();
+        final AtomicBoolean providerClosed = new AtomicBoolean();
+        public int run() {
+            ADMITTED.set(true); inFlight.incrementAndGet(); calls.incrementAndGet();
+            try { if (providerClosed.get()) enteredAfterProviderClose.incrementAndGet(); Thread.onSpinWait(); return 1; }
+            finally { inFlight.decrementAndGet(); }
+        }
+    }
     public static final class Blocking { final CountDownLatch entered = new CountDownLatch(1), exit = new CountDownLatch(1); public int run() { entered.countDown(); blockingAwait(exit); return 1; } }
     public static final class ClosingTarget { private final CodeScope scope; ClosingTarget(CodeScope scope) { this.scope=scope; } public void run() { scope.close(); throw new IllegalArgumentException("original target"); } }
     private static final class SyntheticFatal extends VirtualMachineError { }
@@ -949,6 +1089,7 @@ public final class CoreContractTest {
         Provider(String id,String capability) { this.id=id; this.capability=capability; }
         public ProviderDescriptor descriptor() { if (interruptDescriptorAfterDiscovery && discoveries.get() > 0) CoreContractTest.<RuntimeException>sneakyThrow(new InterruptedException("descriptor")); if (interruptFlagDescriptorAfterDiscovery && discoveries.get() > 0) Thread.currentThread().interrupt(); return new ProviderDescriptor(id,"fixture-1",major,0,capability,dependencies); }
         public CandidateBatch discover(CandidateRequest request) throws InterruptedException { discoveries.incrementAndGet(); if (cancel) throw new CancellationException("fixture"); if (entered!=null) entered.countDown(); if (exit!=null) await(exit); if (interruptAfterWait) throw new InterruptedException("provider"); if (interruptBeforeReturn) Thread.currentThread().interrupt(); return new CandidateBatch(candidates,fingerprint,"finite-handwritten-fixture",complete); }
-        public void close() { closes.incrementAndGet(); if (closeOrder != null) closeOrder.add(id); if (clearInterruptOnClose) closeSawInterrupt.set(Thread.interrupted()); if (closeFailure != null) CoreContractTest.<RuntimeException>sneakyThrow(closeFailure); if (failClose) throw new IllegalStateException("provider close"); }
+        Runnable onClose;
+        public void close() { closes.incrementAndGet(); if (onClose != null) onClose.run(); if (closeOrder != null) closeOrder.add(id); if (clearInterruptOnClose) closeSawInterrupt.set(Thread.interrupted()); if (closeFailure != null) CoreContractTest.<RuntimeException>sneakyThrow(closeFailure); if (failClose) throw new IllegalStateException("provider close"); }
     }
 }

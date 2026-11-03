@@ -10,22 +10,35 @@ import io.github.jichuo1.meguviz.ref.spi.*;
 import java.lang.reflect.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
 
 /** Synchronous code lifetime. close rejects new work without waiting for in-flight target methods. */
 public final class CodeScope implements AutoCloseable {
     public enum State { OPEN, RETIRING, CLOSED }
+    /** Sign bit of {@link #admission}; set exactly once by close, under the lock. */
+    private static final int CLOSING = Integer.MIN_VALUE;
+    /** In-process identities: a per-load random prefix plus a sequence, without SecureRandom per scope. */
+    private static final long IDENTITY_PREFIX = new SplittableRandom().nextLong();
+    private static final AtomicLong IDENTITY_SEQUENCE = new AtomicLong();
     private final Object lock = new Object();
     private final AccessPolicy accessPolicy;
     private final int capacity;
+    /**
+     * In-flight resolutions/invocations in the low bits, CLOSING in the sign bit. Admission CASes the count only while
+     * CLOSING is clear, so close's getAndAdd is the single linearization point: work admitted before it is counted and
+     * drained, later work is rejected without touching the count.
+     */
+    private final AtomicInteger admission = new AtomicInteger();
     private ClassLoader loader;
     private State state = State.OPEN;
-    private String identity = UUID.randomUUID().toString();
+    private String identity = newIdentity();
     private long codeEpoch, nextSlot = 1, cacheHits;
-    private int active;
     private boolean resolved;
     private final Map<QuerySpec, ResolutionResult> cache = new LinkedHashMap<>(16, .75f, true);
-    private final Map<Long, Slot> slots = new HashMap<>();
-    private final Map<Member, Long> memberSlots = new HashMap<>();
+    private final Map<Member, Slot> memberSlots = new HashMap<>();
+    /** Current identity, epoch and append-only slot table; replaced under the lock, read lock-free by plan calls. */
+    private volatile Bindings bindings;
+    /** Created on the first cache miss and dropped by advanceCodeEpoch; diagnostics treat null as empty. */
     private ReflectionResolver resolver;
     private QueryCoordinator<QuerySpec, ResolutionResult> coordinator;
     private ProviderRegistry providers;
@@ -34,8 +47,9 @@ public final class CodeScope implements AutoCloseable {
     private CodeScope(ClassLoader loader, AccessPolicy accessPolicy, int capacity) {
         if (capacity < 1 || capacity > 1000000) throw new IllegalArgumentException("capacity");
         this.loader = loader; this.accessPolicy = Objects.requireNonNull(accessPolicy); this.capacity = capacity;
-        resolver = new ReflectionResolver(capacity); coordinator = new QueryCoordinator<>(Math.min(capacity, 256));
+        bindings = new Bindings(identity, 0, nextSlot, capacity);
     }
+    private static String newIdentity() { return new UUID(IDENTITY_PREFIX, IDENTITY_SEQUENCE.incrementAndGet()).toString(); }
     public static CodeScope open(ClassLoader loader) { return new CodeScope(loader, AccessPolicy.PRESERVE_JAVA_ACCESS, 4096); }
     public static CodeScope open(ClassLoader loader, AccessPolicy accessPolicy, int capacity) { return new CodeScope(loader, accessPolicy, capacity); }
     public AccessPolicy accessPolicy() { return accessPolicy; }
@@ -63,7 +77,8 @@ public final class CodeScope implements AutoCloseable {
             resolved = true;
             ResolutionResult cached = cache.get(query);
             if (cached != null) { cacheHits++; return cached; }
-            active++;
+            admission.incrementAndGet(); // OPEN under the lock, so CLOSING cannot be set concurrently
+            if (resolver == null) { resolver = new ReflectionResolver(capacity); coordinator = new QueryCoordinator<>(Math.min(capacity, 256)); }
             context = new Context(loader, identity, codeEpoch, resolver, coordinator, providers, codeFingerprint);
         }
         try {
@@ -93,19 +108,21 @@ public final class CodeScope implements AutoCloseable {
             // Resolver outcomes are distinct by Member: structural uses visited, provider uses seen, and exact has one entry.
             int missing = 0;
             for (ReflectionResolver.Entry entry : outcome.entries) if (!memberSlots.containsKey(entry.member)) missing++;
-            if ((long) slots.size() + missing > capacity) {
+            Bindings table = bindings;
+            if ((long) table.size + missing > capacity) {
                 if (outcome.status == ResolutionStatus.CANCELLED) {
                     ResolutionReceipt receipt = new ResolutionReceipt(query.summary(), query.selection(), outcome.status, outcome.coverage, Collections.emptyList(), outcome.reason, outcome.cause);
                     return new ResolutionResult(outcome.status, Collections.emptyList(), receipt);
                 }
                 return failure(query, ResolutionStatus.PARTIAL, "binding_capacity");
             }
-            List<ResolvedMember> members = new ArrayList<>();
-            List<MemberDescriptor> descriptors = new ArrayList<>();
+            List<ResolvedMember> members = new ArrayList<>(outcome.entries.size());
+            List<MemberDescriptor> descriptors = new ArrayList<>(outcome.entries.size());
             for (ReflectionResolver.Entry entry : outcome.entries) {
-                Long slot = memberSlots.get(entry.member);
-                if (slot == null) { slot = nextSlot++; memberSlots.put(entry.member, slot); slots.put(slot, new Slot(entry.member, entry.descriptor)); }
-                members.add(new ResolvedMember(identity, codeEpoch, slot, entry.descriptor)); descriptors.add(entry.descriptor);
+                Slot slot = memberSlots.get(entry.member);
+                if (slot == null) { slot = new Slot(nextSlot++, entry.member, entry.descriptor); memberSlots.put(entry.member, slot); table.append(slot); }
+                // Tokens share the slot's (equal) descriptor instance so plan calls usually pass the identity check.
+                members.add(new ResolvedMember(identity, codeEpoch, slot.number, slot.descriptor)); descriptors.add(entry.descriptor);
             }
             ResolutionReceipt receipt = new ResolutionReceipt(query.summary(), query.selection(), outcome.status, outcome.coverage, descriptors, outcome.reason, outcome.cause);
             ResolutionResult result = new ResolutionResult(outcome.status, members, receipt);
@@ -144,14 +161,17 @@ public final class CodeScope implements AutoCloseable {
         Member member = acquire(token);
         try { prepareAccess(member); return member; } finally { release(); }
     }
+    /**
+     * Lock-free admission. The token is checked against one bindings snapshot, then the in-flight count is CASed only
+     * while CLOSING is clear. A snapshot read before the CAS cannot be a closed one: close sets CLOSING before replacing
+     * it. A call admitted with a snapshot read just before advanceCodeEpoch is ordered before that epoch change.
+     */
     private Member acquire(ResolvedMember token) {
-        synchronized (lock) {
-            if (state != State.OPEN || !identity.equals(token.scopeId()) || codeEpoch != token.codeEpoch()) throw new StalePlanException("scope identity or epoch is stale");
-            Slot slot = slots.get(token.slot());
-            if (slot == null) throw new StalePlanException("binding no longer exists");
-            // A public token is not a security capability, but malformed tokens must not select another slot.
-            if (!token.descriptor().equals(slot.descriptor)) throw new StalePlanException("binding descriptor mismatch");
-            active++; return slot.member;
+        Slot slot = bindings.find(token);
+        for (;;) {
+            int value = admission.get();
+            if (value < 0) throw new StalePlanException("scope identity or epoch is stale");
+            if (admission.compareAndSet(value, value + 1)) return slot.member;
         }
     }
     public Object invokeMethod(ResolvedMember token, Object receiver, Object[] arguments) throws IllegalAccessException, InvocationTargetException {
@@ -175,19 +195,21 @@ public final class CodeScope implements AutoCloseable {
         QueryCoordinator<QuerySpec, ResolutionResult> oldCoordinator;
         synchronized (lock) {
             if (state != State.OPEN) throw new StalePlanException("scope closed");
-            if (codeEpoch == Long.MAX_VALUE) { identity = UUID.randomUUID().toString(); codeEpoch = 0; } else codeEpoch++;
-            cache.clear(); slots.clear(); memberSlots.clear(); resolver.clear();
-            resolver = new ReflectionResolver(capacity); codeFingerprint = null;
-            oldCoordinator = coordinator; coordinator = new QueryCoordinator<>(Math.min(capacity, 256));
+            if (codeEpoch == Long.MAX_VALUE) { identity = newIdentity(); codeEpoch = 0; } else codeEpoch++;
+            cache.clear(); memberSlots.clear(); bindings = new Bindings(identity, codeEpoch, nextSlot, capacity);
+            if (resolver != null) resolver.clear();
+            resolver = null; codeFingerprint = null;
+            oldCoordinator = coordinator; coordinator = null;
         }
-        oldCoordinator.close();
+        if (oldCoordinator != null) oldCoordinator.close();
     }
     public Map<String, Long> diagnostics() {
         synchronized (lock) {
             Map<String, Long> values = new LinkedHashMap<>();
-            values.put("cacheHits", cacheHits); values.put("cachedQueries", (long) cache.size()); values.put("bindings", (long) slots.size());
-            values.put("schemas", (long) resolver.schemaSize()); values.put("parameterReads", resolver.parameterReads());
-            values.put("candidateChecks", resolver.candidateChecks()); values.put("lookups", resolver.lookups()); values.put("inFlight", (long) active);
+            values.put("cacheHits", cacheHits); values.put("cachedQueries", (long) cache.size()); values.put("bindings", (long) bindings.size);
+            values.put("schemas", resolver == null ? 0L : (long) resolver.schemaSize()); values.put("parameterReads", resolver == null ? 0L : resolver.parameterReads());
+            values.put("candidateChecks", resolver == null ? 0L : resolver.candidateChecks()); values.put("lookups", resolver == null ? 0L : resolver.lookups());
+            values.put("inFlight", (long) (admission.get() & Integer.MAX_VALUE));
             return Collections.unmodifiableMap(values);
         }
     }
@@ -196,11 +218,13 @@ public final class CodeScope implements AutoCloseable {
         QueryCoordinator<QuerySpec, ResolutionResult> previous;
         synchronized (lock) {
             if (state != State.OPEN) return;
-            state = State.RETIRING; loader = null; cache.clear(); slots.clear(); memberSlots.clear(); resolver.clear(); codeFingerprint = null;
+            int inFlight = admission.getAndAdd(CLOSING); // linearization point; OPEN implies CLOSING was clear
+            state = State.RETIRING; loader = null; bindings = Bindings.CLOSED; cache.clear(); memberSlots.clear(); codeFingerprint = null;
+            if (resolver != null) resolver.clear();
             previous = coordinator;
-            if (active == 0) { state = State.CLOSED; retired = providers; providers = null; }
+            if (inFlight == 0) { state = State.CLOSED; retired = providers; providers = null; }
         }
-        previous.close();
+        if (previous != null) previous.close();
         if (retired != null) {
             try { retired.close(); }
             catch (Throwable failure) {
@@ -211,10 +235,14 @@ public final class CodeScope implements AutoCloseable {
         }
     }
     private void release() {
+        // Only the release that drains the last admitted work after close observes exactly CLOSING.
+        if (admission.decrementAndGet() != CLOSING) return;
         ProviderRegistry retired = null;
         synchronized (lock) {
-            active--;
-            if (active == 0 && state == State.RETIRING) { state = State.CLOSED; retired = providers; providers = null; resolver.clear(); }
+            if (state == State.RETIRING && admission.get() == CLOSING) {
+                state = State.CLOSED; retired = providers; providers = null;
+                if (resolver != null) resolver.clear();
+            }
         }
         if (retired != null) {
             try { retired.close(); }
@@ -227,9 +255,41 @@ public final class CodeScope implements AutoCloseable {
     }
     @SuppressWarnings("unchecked") private static <T extends Throwable> RuntimeException rethrow(Throwable failure) throws T { throw (T) failure; }
     private static final class Slot {
+        final long number;
         final Member member;
         final MemberDescriptor descriptor;
-        Slot(Member member, MemberDescriptor descriptor) { this.member = member; this.descriptor = descriptor; }
+        Slot(long number, Member member, MemberDescriptor descriptor) { this.number = number; this.member = member; this.descriptor = descriptor; }
+    }
+    /** Slot numbers stay globally increasing; this epoch's slot {@code base + i} lives at index {@code i}. */
+    private static final class Bindings {
+        static final Bindings CLOSED = new Bindings(null, 0, 0, 0);
+        private static final Slot[] EMPTY = new Slot[0];
+        final String identity;
+        final long epoch, base;
+        private final int capacity;
+        // Writers hold the scope lock: element, then table (on growth), then size. Readers read size, then table.
+        private volatile Slot[] table = EMPTY;
+        volatile int size;
+        Bindings(String identity, long epoch, long base, int capacity) { this.identity = identity; this.epoch = epoch; this.base = base; this.capacity = capacity; }
+        void append(Slot slot) {
+            Slot[] current = table; int count = size;
+            if (count == current.length) {
+                current = Arrays.copyOf(current, (int) Math.min(capacity, Math.max(8L, 2L * count)));
+                current[count] = slot; table = current;
+            } else current[count] = slot;
+            size = count + 1;
+        }
+        Slot find(ResolvedMember token) {
+            if (identity == null || !identity.equals(token.scopeId()) || epoch != token.codeEpoch()) throw new StalePlanException("scope identity or epoch is stale");
+            long index = token.slot() - base;
+            int count = size;
+            if (index < 0 || index >= count) throw new StalePlanException("binding no longer exists");
+            Slot slot = table[(int) index];
+            // A public token is not a security capability, but malformed tokens must not select another slot.
+            MemberDescriptor descriptor = token.descriptor();
+            if (descriptor != slot.descriptor && !descriptor.equals(slot.descriptor)) throw new StalePlanException("binding descriptor mismatch");
+            return slot;
+        }
     }
     private static final class Context {
         final ClassLoader loader;
