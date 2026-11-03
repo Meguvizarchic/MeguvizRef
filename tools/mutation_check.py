@@ -61,13 +61,21 @@ MUTATIONS = [
      "cache.clear(); if (recent != null) recent = null; memberSlots.clear(); bindings = new Bindings", "cache.clear(); memberSlots.clear(); bindings = new Bindings", SCOPE, "MemoStress"),
     ("table-memo-stale-after-hit", "a member-table map hit does not move the table memo",
      "if (cached != null) { lastTable = new LastTable(owner, shape, cached); return cached; }", "if (cached != null) return cached;", RESOLVER),
+    ("type-cache-ignores-loader", "the exact-descriptor type cache is keyed by name only",
+     "Map<String, Class<?>> names = loaded == null ? null : loaded.get(loader);", "Map<String, Class<?>> names = loaded == null ? null : loaded.get(null);", RESOLVER),
+    ("type-cache-ignores-loader-put", "(companion edit of type-cache-ignores-loader)",
+     "Map<String, Class<?>> names = loaded.get(loader);\n        if (names == null) loaded.put(loader, names = new HashMap<>());",
+     "Map<String, Class<?>> names = loaded.get(null);\n        if (names == null) loaded.put(null, names = new HashMap<>());", RESOLVER),
+    ("type-cache-unbounded", "the type cache ignores the scope capacity",
+     "        if (loadedTypes >= schemaCapacity) return;\n", "", RESOLVER),
     ("table-memo-survives-clear", "clear keeps the member-table memo",
      "tableMembers = 0; lastTable = null; }", "tableMembers = 0; }", RESOLVER),
 ]
 
 # Mutations applied together under one id.
-GROUPS = {"pending-after-closing": ["pending-after-closing", "pending-after-closing-placed"]}
-HIDDEN = {"pending-after-closing-placed"}
+GROUPS = {"pending-after-closing": ["pending-after-closing", "pending-after-closing-placed"],
+          "type-cache-ignores-loader": ["type-cache-ignores-loader", "type-cache-ignores-loader-put"]}
+HIDDEN = {"pending-after-closing-placed", "type-cache-ignores-loader-put"}
 
 
 def run(command, cwd, timeout):

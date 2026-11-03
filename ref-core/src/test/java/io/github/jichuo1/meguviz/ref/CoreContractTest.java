@@ -299,6 +299,48 @@ public final class CoreContractTest {
                 eq(2L, scope.diagnostics().get("bindings"));
             }
         });
+        test("exact-type-cache-keyed-by-initiating-loader", () -> {
+            try (URLClassLoader parent = isolated(fixtures); ChildFirstLoader mixed = new ChildFirstLoader(fixtures.toUri().toURL(), parent, "fixture.ShadowParam", "fixture.ShadowPeer")) {
+                Class<?> parentOwner = Class.forName("fixture.ShadowOwner", false, mixed), peer = Class.forName("fixture.ShadowPeer", false, mixed);
+                Class<?> parentParam = Class.forName("fixture.ShadowParam", false, parent), childParam = Class.forName("fixture.ShadowParam", false, mixed);
+                check(parentOwner.getClassLoader() == parent && peer.getClassLoader() == mixed && parentParam != childParam, "fixture arrangement");
+                MemberDescriptor ownerMethod = MemberDescriptor.method("fixture.ShadowOwner", "method", "Lfixture/ShadowParam;", "Lfixture/ShadowParam;");
+                MemberDescriptor peerMethod = MemberDescriptor.method("fixture.ShadowPeer", "method", "Lfixture/ShadowParam;", "Lfixture/ShadowParam;");
+                for (boolean ownerFirst : new boolean[]{true, false}) {
+                    try (CodeScope scope = CodeScope.open(mixed)) {
+                        for (int round = 0; round < 3; round++) for (int i = 0; i < 2; i++) {
+                            boolean owner = (i == 0) == ownerFirst;
+                            RawResolution raw = scope.resolveRaw(QuerySpec.exact(owner ? ownerMethod : peerMethod));
+                            eq(ResolutionStatus.RESOLVED, raw.status()); Method method = (Method) raw.members().get(0);
+                            eq(owner ? parentOwner : peer, method.getDeclaringClass());
+                            eq(owner ? parentParam : childParam, method.getParameterTypes()[0]); eq(owner ? parentParam : childParam, method.getReturnType());
+                        }
+                        Map<?, ?> cache = loadedTypes(scope); eq(2, cache.size()); check(cache.containsKey(parent) && cache.containsKey(mixed), "one entry set per initiating loader");
+                        eq(parentParam, ((Map<?, ?>) cache.get(parent)).get("Lfixture/ShadowParam;")); eq(childParam, ((Map<?, ?>) cache.get(mixed)).get("Lfixture/ShadowParam;"));
+                        eq(parentOwner, ((Map<?, ?>) cache.get(mixed)).get("fixture.ShadowOwner")); eq(peer, ((Map<?, ?>) cache.get(mixed)).get("fixture.ShadowPeer"));
+                        scope.advanceCodeEpoch("types"); eq(null, loadedTypes(scope));
+                        eq(ResolutionStatus.RESOLVED, scope.resolveRaw(QuerySpec.exact(peerMethod)).status()); eq(null, loadedTypes(scope)); // first lookup of a resolver is uncached
+                        eq(ResolutionStatus.RESOLVED, scope.resolveRaw(QuerySpec.exact(peerMethod)).status()); eq(1, loadedTypes(scope).size());
+                        scope.close(); eq(null, loadedTypes(scope));
+                    }
+                }
+            }
+        });
+        test("exact-type-cache-has-no-negative-entries-and-is-bounded", () -> {
+            try (URLClassLoader parent = isolated(fixtures); FlakyLoader flaky = new FlakyLoader(fixtures.toUri().toURL(), parent, "fixture.ShadowParam")) {
+                MemberDescriptor peerMethod = MemberDescriptor.method("fixture.ShadowPeer", "method", "Lfixture/ShadowParam;", "Lfixture/ShadowParam;");
+                try (CodeScope scope = CodeScope.open(flaky)) {
+                    ResolutionResult first = scope.resolve(QuerySpec.exact(peerMethod));
+                    eq(ResolutionStatus.UNAVAILABLE, first.status()); eq("owner_type_unavailable", first.receipt().reason()); eq(1, flaky.failures.get());
+                    eq(ResolutionStatus.RESOLVED, scope.resolve(QuerySpec.exact(peerMethod)).status()); // the failure was not cached
+                }
+                try (CodeScope small = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 3)) {
+                    for (Method method : String.class.getDeclaredMethods()) if (Modifier.isPublic(method.getModifiers())) small.resolveRaw(QuerySpec.exact(MemberDescriptor.from(method)));
+                    int entries = 0; for (Object names : loadedTypes(small).values()) entries += ((Map<?, ?>) names).size();
+                    eq(3, entries);
+                }
+            }
+        });
         test("loader-shadow-exact-provider-and-structural-use-owner-signature-identity", () -> {
             try (URLClassLoader parent = isolated(fixtures);
                  ShadowLoader parentOwner = new ShadowLoader(fixtures.toUri().toURL(), parent, false);
@@ -1610,11 +1652,11 @@ public final class CoreContractTest {
         Path root = Path.of("").toAbsolutePath(); while (!Files.isDirectory(root.resolve("test-fixtures/isolated-src"))) { root = root.getParent(); if (root == null) throw new IOException("test-fixtures not found"); }
         fixtures = Files.createDirectories(root.resolve("ref-core/build/isolated-fixtures/all")); missing = Files.createDirectories(root.resolve("ref-core/build/isolated-fixtures/missing/fixture")).getParent();
         Path sources = root.resolve("test-fixtures/isolated-src/fixture");
-        int result = ToolProvider.getSystemJavaCompiler().run(null,System.out,System.err,"--release","17","-d",fixtures.toString(),sources.resolve("LoaderFixture.java").toString(),sources.resolve("MissingType.java").toString(),sources.resolve("MissingSignatureFixture.java").toString(),sources.resolve("ShadowParam.java").toString(),sources.resolve("ShadowOwner.java").toString());
+        int result = ToolProvider.getSystemJavaCompiler().run(null,System.out,System.err,"--release","17","-d",fixtures.toString(),sources.resolve("LoaderFixture.java").toString(),sources.resolve("MissingType.java").toString(),sources.resolve("MissingSignatureFixture.java").toString(),sources.resolve("ShadowParam.java").toString(),sources.resolve("ShadowOwner.java").toString(),sources.resolve("ShadowPeer.java").toString());
         if (result != 0) throw new IOException("fixture compilation failed: " + result);
         Files.copy(fixtures.resolve("fixture/MissingSignatureFixture.class"), missing.resolve("fixture/MissingSignatureFixture.class"), StandardCopyOption.REPLACE_EXISTING);
         Path completeJar = root.resolve("ref-core/build/isolated-fixtures/complete-fixture.jar");
-        fixtureJar(completeJar, fixtures, "fixture/LoaderFixture.class", "fixture/MissingType.class", "fixture/MissingSignatureFixture.class", "fixture/ShadowParam.class", "fixture/ShadowOwner.class");
+        fixtureJar(completeJar, fixtures, "fixture/LoaderFixture.class", "fixture/MissingType.class", "fixture/MissingSignatureFixture.class", "fixture/ShadowParam.class", "fixture/ShadowOwner.class", "fixture/ShadowPeer.class");
         Path missingJar = root.resolve("ref-core/build/isolated-fixtures/missing-signature-fixture.jar");
         fixtureJar(missingJar, missing, "fixture/MissingSignatureFixture.class");
         fixtures = completeJar; missing = missingJar;
@@ -1625,6 +1667,31 @@ public final class CoreContractTest {
         }
     }
     private static URLClassLoader isolated(Path directory) throws MalformedURLException { return new URLClassLoader(new URL[]{directory.toUri().toURL()}, null); }
+    /** Defines the named fixture classes itself and delegates every other name to its parent. */
+    private static class ChildFirstLoader extends URLClassLoader {
+        private final Set<String> local;
+        ChildFirstLoader(URL location, ClassLoader parent, String... local) { super(new URL[]{location}, parent); this.local = new HashSet<>(Arrays.asList(local)); }
+        @Override protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            synchronized (getClassLoadingLock(name)) {
+                if (!local.contains(name)) return super.loadClass(name, resolve);
+                Class<?> type = findLoadedClass(name); if (type == null) type = findClass(name);
+                if (resolve) resolveClass(type); return type;
+            }
+        }
+    }
+    /** Child-first for ShadowPeer; the first lookup of the flaky name fails, later ones delegate to the parent. */
+    private static final class FlakyLoader extends ChildFirstLoader {
+        private final String flaky; final AtomicInteger failures = new AtomicInteger();
+        FlakyLoader(URL location, ClassLoader parent, String flaky) { super(location, parent, "fixture.ShadowPeer"); this.flaky = flaky; }
+        @Override protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            if (name.equals(flaky) && failures.compareAndSet(0, 1)) throw new ClassNotFoundException(name + " (first lookup fails)");
+            return super.loadClass(name, resolve);
+        }
+    }
+    private static Map<?, ?> loadedTypes(CodeScope scope) throws ReflectiveOperationException {
+        Object resolver = field(CodeScope.class, "resolver").get(scope); if (resolver == null) return null;
+        synchronized (resolver) { Map<?, ?> loaded = (Map<?, ?>) field(ReflectionResolver.class, "loaded").get(resolver); return loaded == null ? null : new IdentityHashMap<>(loaded); }
+    }
     private static final class ShadowLoader extends URLClassLoader {
         private final boolean childOwner;
         ShadowLoader(URL location, ClassLoader parent, boolean childOwner) { super(new URL[]{location}, parent); this.childOwner = childOwner; }

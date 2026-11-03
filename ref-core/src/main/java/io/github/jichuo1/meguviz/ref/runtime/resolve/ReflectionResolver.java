@@ -25,6 +25,17 @@ public final class ReflectionResolver {
      * queries on one owner reuses the table without a key allocation or map lookup.
      */
     private volatile LastTable lastTable;
+    /**
+     * Positive cache of {@code Class.forName(name, false, loader)} for owner names and exact-descriptor types, keyed by
+     * the initiating loader's identity and then the name (owner binary names and descriptor strings never collide:
+     * owners cannot contain ';' or '['). HotSpot records a successful lookup in that loader's dictionary and ART in its
+     * class table, so a later call with the same loader returns the same Class; a hit therefore equals a repeated
+     * call, and one loader can never receive a Class looked up through another. Failures are never cached. Used from
+     * the resolver's second lookup on, so a scope that resolves once allocates nothing for it. At most
+     * {@code schemaCapacity} entries; dropped with the resolver (epoch, close).
+     */
+    private IdentityHashMap<ClassLoader, Map<String, Class<?>>> loaded;
+    private int loadedTypes;
     /** Last coverage universe built by any resolver; immutable, so a racy read sees a complete value or another one. */
     private static Universe lastUniverse;
     private final AtomicLong parameterReads = new AtomicLong(), candidateChecks = new AtomicLong(), lookups = new AtomicLong();
@@ -33,7 +44,33 @@ public final class ReflectionResolver {
     public long candidateChecks() { return candidateChecks.get(); }
     public long lookups() { return lookups.get(); }
     public synchronized int schemaSize() { return schemas.size(); }
-    public synchronized void clear() { schemas.clear(); tables.clear(); tableMembers = 0; lastTable = null; }
+    public synchronized void clear() { schemas.clear(); tables.clear(); tableMembers = 0; lastTable = null; loaded = null; loadedTypes = 0; }
+    private synchronized Class<?> loadedType(ClassLoader loader, String name) {
+        Map<String, Class<?>> names = loaded == null ? null : loaded.get(loader);
+        return names == null ? null : names.get(name);
+    }
+    private synchronized void rememberType(ClassLoader loader, String name, Class<?> type) {
+        if (loadedTypes >= schemaCapacity) return;
+        if (loaded == null) loaded = new IdentityHashMap<>();
+        Map<String, Class<?>> names = loaded.get(loader);
+        if (names == null) loaded.put(loader, names = new HashMap<>());
+        if (names.putIfAbsent(name, type) == null) loadedTypes++;
+    }
+    /** {@code Class.forName(name, false, loader)} through the per-scope cache. */
+    private Class<?> loadOwner(String name, ClassLoader loader) throws ClassNotFoundException {
+        if (lookups.get() < 2) return Class.forName(name, false, loader);
+        Class<?> type = loadedType(loader, name);
+        if (type == null) { type = Class.forName(name, false, loader); rememberType(loader, name, type); }
+        return type;
+    }
+    /** {@code descriptor.resolve(loader)} through the per-scope cache; primitives never reach the cache. */
+    private Class<?> resolveType(TypeDescriptor descriptor, ClassLoader loader) throws ClassNotFoundException {
+        String value = descriptor.value();
+        if (value.length() == 1 || lookups.get() < 2) return descriptor.resolve(loader);
+        Class<?> type = loadedType(loader, value);
+        if (type == null) { type = descriptor.resolve(loader); rememberType(loader, value, type); }
+        return type;
+    }
     private synchronized MethodSchema schema(Member member) {
         MethodSchema cached = schemas.get(member);
         if (cached != null) return cached;
@@ -49,7 +86,7 @@ public final class ReflectionResolver {
         lookups.incrementAndGet();
         if (Thread.currentThread().isInterrupted()) return failure(ResolutionStatus.CANCELLED, query, "interrupted", null);
         try {
-            Class<?> owner = query.runtimeOwner() == null ? Class.forName(query.owner(), false, loader) : query.runtimeOwner();
+            Class<?> owner = query.runtimeOwner() == null ? loadOwner(query.owner(), loader) : query.runtimeOwner();
             if (query.providerId() != null) return provider(query, owner, loader, registry, codeFingerprint);
             if (query.exactDescriptor() != null) return exact(query, owner, loader);
             return structural(query, owner);
@@ -65,12 +102,12 @@ public final class ReflectionResolver {
         Class<?>[] parameters = new Class<?>[d.parameters().size()];
         Class<?> type;
         try {
-            for (int i = 0; i < parameters.length; i++) parameters[i] = d.parameters().get(i).resolve(loader);
-            type = d.type().resolve(loader);
+            for (int i = 0; i < parameters.length; i++) parameters[i] = resolveType(d.parameters().get(i), loader);
+            type = resolveType(d.type(), loader);
         } catch (SecurityException denied) {
             if (loader == scopeLoader) throw denied;
-            for (int i = 0; i < parameters.length; i++) parameters[i] = d.parameters().get(i).resolve(scopeLoader);
-            type = d.type().resolve(scopeLoader);
+            for (int i = 0; i < parameters.length; i++) parameters[i] = resolveType(d.parameters().get(i), scopeLoader);
+            type = resolveType(d.type(), scopeLoader);
         }
         try {
             Member member;

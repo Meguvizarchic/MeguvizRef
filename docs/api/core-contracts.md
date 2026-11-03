@@ -10,7 +10,7 @@
 
 携带 `runtimeOwner`、参数/返回 `Class` 或实参类型的查询会强持有这些类；调用方长期保存查询时也可能延长其定义加载器的生命周期，scope 关闭不会清除调用方持有的查询。`QuerySpec.builder(Class, ...)` 使用传入的 Class，即使作用域配置了另一个 loader；`scope.usesLoader(loader)` 只核对作用域自身的 loader，不证明查询的 Class 由该 loader 选择。调用方可将通过预期 loader 实际加载得到的 owner 与查询的 `runtimeOwner()` 按引用比较；使用 `getClassLoader() == loader` 会错误排除正常的父加载器委派。对更新后的代码或其他 loader，应重新确认条件并在必要时重建查询。
 
-精确描述符先走公开精确反射入口。owner 经作用域 loader 加载后，参数及返回/字段类型优先使用该 owner 的定义加载器解析；这与实际声明的类型身份一致，避免子加载器遮蔽同名类型造成误判。若读取定义加载器或使用它解析类型被安全管理器拒绝，则回退到原有作用域 loader 路径，并继续用反射实际 `Class` 身份校验；权限受限且类型被遮蔽时仍可能保守失败。协变返回/bridge 的返回类型不符时，在预算内回退到声明域验证完整签名。类加载使用 `Class.forName(name, false, loader)`，查询不会主动初始化。不存在与系统过滤统一为 `UNAVAILABLE/not_found_or_filtered`，不会构造物理不存在证明。
+精确描述符先走公开精确反射入口。owner 经作用域 loader 加载后，参数及返回/字段类型优先使用该 owner 的定义加载器解析；这与实际声明的类型身份一致，避免子加载器遮蔽同名类型造成误判。若读取定义加载器或使用它解析类型被安全管理器拒绝，则回退到原有作用域 loader 路径，并继续用反射实际 `Class` 身份校验；权限受限且类型被遮蔽时仍可能保守失败。协变返回/bridge 的返回类型不符时，在预算内回退到声明域验证完整签名。类加载使用 `Class.forName(name, false, loader)`，查询不会主动初始化。同一作用域（同一 epoch）内从第二次查找起，owner 与参数/返回/字段类型的成功加载结果按（发起加载器身份，名字）缓存（1.1.0 起）：命中与对同一加载器重复调用 `Class.forName` 得到同一个 `Class`，一个加载器不会得到经另一个加载器查到的类；失败不缓存，条目数不超过作用域容量，随 `advanceCodeEpoch` 和 `close` 丢弃。缓存命中时不再重复 `Class.forName` 内部的安全管理器检查，同一（加载器，名字）的权限决定只在首次查找时评估；`getClassLoader()` 的检查与上述回退不变。不存在与系统过滤统一为 `UNAVAILABLE/not_found_or_filtered`，不会构造物理不存在证明。
 
 `DECLARED` 只遍历声明类；`SUPERCLASSES` 按当前类、父类直到 Object 逐级处理；`JAVA_PUBLIC` 使用 Java 公共成员查询语义。构造器不继承，不提供自定义 interface DAG 查询。
 

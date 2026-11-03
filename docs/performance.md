@@ -67,6 +67,20 @@ Spring 的 `ReflectionUtils` 也缓存 `getDeclaredMethods()` 结果以避免新
 - `resolveRaw(QuerySpec)`：与 `resolve` 相同的状态和回执，直接返回原始成员，不创建 binding，长会话不会因导出累计触发 `binding_capacity`。
 - `isCurrent(loader, identity, epoch)`：一次加锁完成三项检查。
 
+### 精确描述符类型缓存：加载器身份审查（第 2 轮）
+
+精确描述符查询每次未命中都对 owner 调用 `Class.forName(owner, false, 作用域 loader)`，并对每个引用类型的参数和返回/字段类型调用 `Class.forName(name, false, L)`。Provider 候选复核和遮蔽声明类的精确复核走同一路径。实现缓存之前，先对照[核心约定](api/core-contracts.md)核对加载器身份：
+
+1. 约定：owner 经作用域 loader 加载；类型优先用 owner 的定义加载器 L 解析，使类型身份与实际声明一致；读取 L 或用 L 解析被安全管理器拒绝时回退到作用域 loader，再用反射得到的实际 `Class` 校验；不初始化；没有负缓存。
+2. 键：（发起加载器的引用身份，名字）。先按加载器身份选子表，再按名字查找，所以一个加载器永远拿不到经另一个加载器查到的 `Class`；回退路径以作用域 loader 为键，和定义加载器的条目分开。owner 的二进制名不能含 `;` 或 `[`，类型条目用描述符字符串（`L...;`、`[...`），两类名字不会相同。
+3. 命中等价于重新调用：HotSpot 在 `loadClass` 返回由其他加载器定义的类后，把 L 记为该类的发起加载器（JDK 17 [`SystemDictionary::load_instance_class`](https://github.com/openjdk/jdk17u/blob/master/src/hotspot/share/classfile/systemDictionary.cpp) 中的 `update_dictionary`），之后同一 L 的查找先命中 L 的字典；ART 的 [`ClassLinker::FindClass`](https://android.googlesource.com/platform/art/+/refs/heads/main/runtime/class_linker.cc) 先查 L 的类表，`loadClass` 成功后把结果插入 L 的类表，竞态时返回先记录的类。JVMS [§5.3](https://docs.oracle.com/javase/specs/jvms/se17/html/jvms-5.html#jvms-5.3) 规定 JVM 记录发起加载器。因此缓存首次成功的结果，与之后对同一 L 再次调用得到同一个类。
+4. 只缓存成功：`ClassNotFoundException`、`LinkageError` 和 `SecurityException` 都不进缓存，下次重新查找。
+5. 生命周期与上限：缓存属于 resolver，随 epoch 推进和 close 丢弃，与成员表和 schema 缓存相同；条目数不超过作用域容量。打开期间强持有这些 `Class`，因而也延长其定义加载器的生命周期，直到 epoch 推进或 close。
+6. 安全管理器：命中时不再执行 `Class.forName` 内部的权限检查，同一（加载器，名字）的决定只在首次查找时评估。SecurityManager 自 JDK 17 起弃用并计划移除（[JEP 411](https://openjdk.org/jeps/411)），Android 没有它；每次查询仍调用 `getClassLoader()` 并执行其权限检查，回退行为不变。`LoaderSecurityContractTest` 的四项用例照常通过。
+7. 不增加单次解析的成本：resolver 的第一次查找不使用缓存、不分配缓存结构，同一作用域出现第二次查找后才开始缓存。
+
+结论：可以做，键必须包含发起加载器身份。合同测试用一个子优先加载器构造"两个 owner 的定义加载器不同、参数类型同名但身份不同"的场景，在同一作用域内交替查询，并检查无负缓存、容量上限和随 epoch/close 丢弃；变异检查确认"只按名字做键"和"不受容量约束"两种变体会失败。
+
 ## MethodHandle / LambdaMetafactory 调研（未采用）
 
 - JDK 18 起核心反射本身改用 method handle 实现（[JEP 416](https://openjdk.org/jeps/416)）。JDK 17 的 `Method.invoke` 前若干次走本地实现，之后生成字节码访问器。上表中直接 `Method.invoke` 约 3.8 ns，计划调用剩余开销主要来自准入，不在反射调用本身。
