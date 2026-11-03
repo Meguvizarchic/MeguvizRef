@@ -40,6 +40,22 @@ public final class AdmissionStress {
     }
 
     /**
+     * On an inflated scope a resolution counts in the base word and a plan call in a cell: r1 resolver, r2 caller,
+     * r3 provider closes, r4 violations. Close must drain both kinds of word.
+     */
+    @JCStressTest
+    @Outcome(id = {"0, 0, 1, 0", "0, 1, 1, 0", "1, 0, 1, 0", "1, 1, 1, 0"}, expect = ACCEPTABLE, desc = "Both words drain before the single provider close.")
+    @Outcome(expect = FORBIDDEN, desc = "Provider closed zero or several times, early, or by a rejected caller.")
+    @State
+    public static class ResolveAndCallWhileClosingCells {
+        final Fixture f = new Fixture(true);
+        @Actor public void resolver(IIII_Result r) { r.r1 = f.resolve(); }
+        @Actor public void caller(IIII_Result r) { r.r2 = f.call(); }
+        @Actor public void closer() { f.close(); }
+        @Arbiter public void arbiter(IIII_Result r) { r.r3 = f.closes.get(); r.r4 = f.violations.get(); }
+    }
+
+    /**
      * Two closers race one caller on an inflated scope: r1 caller, r2 provider closes, r3 violations.
      */
     @JCStressTest

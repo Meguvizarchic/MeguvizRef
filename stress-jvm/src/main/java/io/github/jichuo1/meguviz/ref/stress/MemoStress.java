@@ -68,8 +68,9 @@ public final class MemoStress {
     }
 
     /**
-     * Capacity 2 with a and b cached; one actor hits a and b, another misses c (put + eviction). Afterwards the memo,
-     * when set, must still be the LRU tail: r1 = 1 when that holds.
+     * Capacity 2 with a and b cached; one actor hits a and b, another misses c, a different query for a's member (so
+     * it needs no new binding and is cached: put + eviction). Afterwards the memo, when set, must still be the LRU
+     * tail: r1 = 1 when that holds.
      */
     @JCStressTest
     @Outcome(id = "1", expect = ACCEPTABLE, desc = "The memo is empty or the most recently used cache entry.")
@@ -85,7 +86,7 @@ public final class MemoStress {
             } catch (ReflectiveOperationException e) { throw new ExceptionInInitializerError(e); }
         }
         final CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 2);
-        final QuerySpec a = query("a"), b = query("b"), c = query("c");
+        final QuerySpec a = query("a"), b = query("b"), c = QuerySpec.method(Target.class, "a");
         public MemoStaysLruTail() { scope.resolve(a); scope.resolve(b); scope.resolve(b); }
         @Actor public void hitter() { scope.resolve(a); scope.resolve(b); }
         @Actor public void misser() { scope.resolve(c); }

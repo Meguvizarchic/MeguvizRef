@@ -3,6 +3,8 @@ package io.github.jichuo1.meguviz.ref.stress;
 import io.github.jichuo1.meguviz.ref.api.descriptor.MemberDescriptor;
 import io.github.jichuo1.meguviz.ref.api.evidence.CodeIdentity;
 import io.github.jichuo1.meguviz.ref.api.query.QuerySpec;
+import io.github.jichuo1.meguviz.ref.api.result.ResolutionResult;
+import io.github.jichuo1.meguviz.ref.api.result.ResolutionStatus;
 import io.github.jichuo1.meguviz.ref.runtime.invoke.MethodPlan;
 import io.github.jichuo1.meguviz.ref.runtime.invoke.StalePlanException;
 import io.github.jichuo1.meguviz.ref.scope.CodeScope;
@@ -18,6 +20,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class Fixture {
     static final ThreadLocal<Boolean> ADMITTED = ThreadLocal.withInitial(() -> false);
     static final ThreadLocal<Boolean> CLOSER = ThreadLocal.withInitial(() -> false);
+    static final ThreadLocal<Boolean> RESOLVING = ThreadLocal.withInitial(() -> false);
     private static final CodeIdentity IDENTITY = CodeIdentity.strong(Collections.singletonMap("stress", "b".repeat(64)), "stress-fixture", QuerySpec.RULE_VERSION);
     private static final Method INFLATE;
     static {
@@ -25,6 +28,7 @@ public final class Fixture {
         catch (ReflectiveOperationException e) { throw new ExceptionInInitializerError(e); }
     }
     final AtomicInteger closes = new AtomicInteger(), violations = new AtomicInteger();
+    volatile boolean closedByResolver;
     final Probe probe = new Probe(violations);
     final CodeScope scope = CodeScope.open(Fixture.class.getClassLoader());
     final MethodPlan plan;
@@ -46,6 +50,20 @@ public final class Fixture {
             if (!"scope identity or epoch is stale".equals(rejected.getMessage())) violations.incrementAndGet();
             return 0;
         } catch (ReflectiveOperationException e) { throw new IllegalStateException(e); }
+    }
+
+    /**
+     * A structural query for the probe's member, not cached yet, so the resolution counts in the base admission word.
+     * 1 when admitted (any result but STALE/scope_closed), 0 when rejected; a rejected resolution must not have closed
+     * the providers.
+     */
+    int resolve() {
+        RESOLVING.set(true);
+        ResolutionResult result;
+        try { result = scope.resolve(QuerySpec.method(Probe.class, "run")); } finally { RESOLVING.set(false); }
+        boolean rejected = result.status() == ResolutionStatus.STALE && "scope_closed".equals(result.receipt().reason());
+        if (rejected && closedByResolver) violations.incrementAndGet();
+        return rejected ? 0 : 1;
     }
 
     void close() {
@@ -71,7 +89,8 @@ public final class Fixture {
         public void close() {
             closes.incrementAndGet();
             if (probe.inFlight.get() != 0) violations.incrementAndGet();
-            if (!CLOSER.get() && !ADMITTED.get()) violations.incrementAndGet();
+            if (RESOLVING.get()) closedByResolver = true;
+            else if (!CLOSER.get() && !ADMITTED.get()) violations.incrementAndGet();
             probe.providerClosed = true;
         }
     }
