@@ -37,6 +37,7 @@ public final class CoreContractTest {
         providerArityContracts();
         concurrencyContracts();
         scopeFastPathContracts();
+        stripedAdmissionContracts();
         memberTableContracts();
         recentHitContracts();
         descriptorFastPathContracts();
@@ -942,6 +943,176 @@ public final class CoreContractTest {
             scope.close(); for (long value : scope.diagnostics().values()) eq(0L, value);
             CodeScope unused = CodeScope.open(LOADER); unused.advanceCodeEpoch("never resolved"); eq(1L, unused.codeEpoch()); unused.close(); eq(CodeScope.State.CLOSED, unused.state());
         });
+    }
+    private static void stripedAdmissionContracts() {
+        test("striped-admission-inflates-only-on-observed-contention", () -> {
+            QuerySpec run = QuerySpec.exact(MemberDescriptor.method(Counting.class.getName(), "run", "I"));
+            CodeScope quiet = CodeScope.open(LOADER); MethodPlan plan = quiet.bindMethod(quiet.resolve(run).requireSingle()); Counting counting = new Counting();
+            for (int i = 0; i < 20000; i++) eq(1, plan.invoke(counting, new Object[0]));
+            eq(null, cells(quiet)); quiet.close(); eq(null, cells(quiet));
+            for (int i = 0; i < 200; i++) { CodeScope scope = CodeScope.open(LOADER); scope.close(); eq(null, cells(scope)); }
+            CodeScope busy = CodeScope.open(LOADER); MethodPlan shared = busy.bindMethod(busy.resolve(run).requireSingle()); Counting target = new Counting();
+            AtomicLong admitted = new AtomicLong(); AtomicReference<Throwable> failure = new AtomicReference<>(); List<Thread> workers = new ArrayList<>();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            for (int w = 0; w < 4; w++) {
+                Thread worker = new Thread(() -> {
+                    try { while (System.nanoTime() < deadline && cellsOrNull(busy) == null) for (int i = 0; i < 256; i++) { shared.invoke(target, new Object[0]); admitted.incrementAndGet(); } }
+                    catch (Throwable error) { failure.set(error); }
+                });
+                worker.setDaemon(true); workers.add(worker); worker.start();
+            }
+            for (Thread worker : workers) { worker.join(15000); check(!worker.isAlive(), "worker stopped"); }
+            eq(null, failure.get()); AtomicIntegerArray table = cells(busy); check(table != null, "a failed base CAS inflated the cells");
+            int count = (Integer) field(CodeScope.class, "CELLS").get(null), stride = (Integer) field(CodeScope.class, "STRIDE").get(null);
+            check(Integer.bitCount(count) == 1 && count >= 2 && count <= 64 && count >= Math.min(64, Runtime.getRuntime().availableProcessors()), "cell count " + count);
+            eq(32, stride); eq((count + 2) * stride, table.length());
+            eq((long) target.calls.get(), admitted.get()); eq(0L, busy.diagnostics().get("inFlight"));
+            check(cells(busy) == table, "cells are never replaced"); busy.close(); eq(CodeScope.State.CLOSED, busy.state());
+            for (int cell = 1; cell <= count; cell++) eq(Integer.MIN_VALUE, table.get(cell * stride));
+        });
+        for (boolean baseLast : new boolean[]{false, true}) test("striped-admission-close-drains-cells-and-base-before-provider-close" + (baseLast ? "-base-last" : "-cells-last"), () -> {
+            Provider provider = new Provider("p", ""); provider.entered = new CountDownLatch(1); provider.exit = new CountDownLatch(1);
+            CodeScope scope = providerScope(provider); inflate(scope); ExecutorService executor = Executors.newFixedThreadPool(4);
+            Blocking[] targets = {new Blocking(), new Blocking(), new Blocking()};
+            try {
+                MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Blocking.class.getName(), "run", "I"))).requireSingle());
+                List<Future<Object>> calls = new ArrayList<>();
+                for (Blocking target : targets) { calls.add(executor.submit(() -> plan.invoke(target, new Object[0]))); await(target.entered); }
+                eq(3L, cellCounts(scope)); // plan calls count in cells once they exist
+                Future<ResolutionResult> resolving = executor.submit(() -> scope.resolve(providerQuery())); await(provider.entered);
+                eq(4L, scope.diagnostics().get("inFlight"));
+                scope.close(); eq(CodeScope.State.RETIRING, scope.state()); eq(0, provider.closes.get());
+                Blocking late = new Blocking(); late.exit.countDown();
+                eq("scope identity or epoch is stale", expect(StalePlanException.class, () -> plan.invoke(late, new Object[0])).getMessage());
+                eq(1L, late.entered.getCount()); eq(4L, scope.diagnostics().get("inFlight"));
+                if (baseLast) { for (int i = 0; i < 3; i++) { targets[i].exit.countDown(); eq(1, calls.get(i).get(3, TimeUnit.SECONDS)); eq(0, provider.closes.get()); } }
+                else { targets[0].exit.countDown(); eq(1, calls.get(0).get(3, TimeUnit.SECONDS)); }
+                eq(CodeScope.State.RETIRING, scope.state());
+                provider.exit.countDown(); ResolutionResult stale = resolving.get(3, TimeUnit.SECONDS); eq(ResolutionStatus.STALE, stale.status());
+                if (!baseLast) {
+                    eq(0, provider.closes.get()); targets[1].exit.countDown(); eq(1, calls.get(1).get(3, TimeUnit.SECONDS)); eq(0, provider.closes.get());
+                    eq(1L, scope.diagnostics().get("inFlight")); targets[2].exit.countDown(); eq(1, calls.get(2).get(3, TimeUnit.SECONDS));
+                }
+                eq(1, provider.closes.get()); eq(CodeScope.State.CLOSED, scope.state()); eq(0L, scope.diagnostics().get("inFlight"));
+                scope.close(); eq(1, provider.closes.get());
+            } finally { provider.exit.countDown(); for (Blocking target : targets) target.exit.countDown(); scope.close(); executor.shutdownNow(); }
+        });
+        test("striped-admission-cell-call-checks-base-word-first", () -> {
+            // White-box: the state close leaves after its first step (base word closed, cells still open).
+            try (CodeScope scope = CodeScope.open(LOADER)) {
+                inflate(scope); MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Counting.class.getName(), "run", "I"))).requireSingle());
+                Counting counting = new Counting(); eq(1, plan.invoke(counting, new Object[0])); eq(1, counting.calls.get());
+                AtomicInteger base = (AtomicInteger) field(CodeScope.class, "admission").get(scope); base.getAndAdd(Integer.MIN_VALUE);
+                try {
+                    for (int t = 0; t < 4; t++) {
+                        AtomicReference<Throwable> outcome = new AtomicReference<>();
+                        Thread caller = new Thread(() -> { try { plan.invoke(counting, new Object[0]); } catch (Throwable error) { outcome.set(error); } });
+                        caller.start(); caller.join(3000);
+                        check(outcome.get() instanceof StalePlanException, "rejected while the base word is closed: " + outcome.get());
+                        eq("scope identity or epoch is stale", outcome.get().getMessage());
+                    }
+                    eq(1, counting.calls.get()); eq(0L, cellCounts(scope));
+                } finally { base.getAndAdd(Integer.MIN_VALUE); }
+                eq(1, plan.invoke(counting, new Object[0]));
+            }
+        });
+        test("striped-admission-close-sets-base-word-before-cells", () -> {
+            for (int round = 0; round < 200; round++) {
+                CodeScope scope = CodeScope.open(LOADER); inflate(scope);
+                AtomicInteger base = (AtomicInteger) field(CodeScope.class, "admission").get(scope); AtomicIntegerArray table = cells(scope);
+                int count = (Integer) field(CodeScope.class, "CELLS").get(null), stride = (Integer) field(CodeScope.class, "STRIDE").get(null);
+                AtomicInteger violations = new AtomicInteger(); AtomicBoolean closeReturned = new AtomicBoolean(); CountDownLatch watching = new CountDownLatch(1);
+                Thread observer = new Thread(() -> {
+                    watching.countDown();
+                    for (boolean last = false; !last; ) {
+                        last = closeReturned.get();
+                        // Reading a closed cell and then an open base word proves the cell was closed first.
+                        for (int cell = count; cell >= 1; cell--) if (table.get(cell * stride) < 0 && base.get() >= 0) violations.incrementAndGet();
+                    }
+                });
+                observer.setDaemon(true); observer.start(); await(watching); scope.close(); closeReturned.set(true); observer.join(6000);
+                check(!observer.isAlive(), "observer stopped"); eq(0, violations.get());
+                check(base.get() < 0, "base word closed"); for (int cell = 1; cell <= count; cell++) check(table.get(cell * stride) < 0, "cell " + cell + " closed");
+            }
+        });
+        test("striped-admission-close-race-stress-natural-contention", () -> admissionCloseRace(false, 100));
+        test("striped-admission-close-race-stress-inflated", () -> admissionCloseRace(true, 150));
+        test("striped-admission-concurrent-closers-close-providers-once", () -> {
+            for (int round = 0; round < 100; round++) {
+                Provider provider = new Provider("p", ""); CodeScope scope = providerScope(provider); if (round % 2 == 0) inflate(scope);
+                MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Counting.class.getName(), "run", "I"))).requireSingle());
+                Counting counting = new Counting(); AtomicReference<Throwable> failure = new AtomicReference<>(); CountDownLatch start = new CountDownLatch(1);
+                List<Thread> threads = new ArrayList<>();
+                for (int t = 0; t < 6; t++) {
+                    boolean closer = t % 2 == 0; long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                    Thread thread = new Thread(() -> {
+                        try {
+                            start.await();
+                            if (closer) { scope.close(); return; }
+                            for (;;) { if (System.nanoTime() > deadline) throw new AssertionError("caller never rejected"); try { plan.invoke(counting, new Object[0]); } catch (StalePlanException stale) { return; } }
+                        } catch (Throwable error) { failure.set(error); }
+                    });
+                    thread.setDaemon(true); threads.add(thread); thread.start();
+                }
+                start.countDown(); for (Thread thread : threads) { thread.join(6000); check(!thread.isAlive(), "thread stopped"); }
+                eq(null, failure.get()); eq(1, provider.closes.get()); eq(CodeScope.State.CLOSED, scope.state()); eq(0L, scope.diagnostics().get("inFlight"));
+            }
+        });
+    }
+    /**
+     * Close races calls from four workers. Violations: a provider closed with a target in flight or by a caller that
+     * was not admitted, a call admitted after close returned or after another caller had already been rejected, and
+     * any provider close count other than one.
+     */
+    private static void admissionCloseRace(boolean inflated, int rounds) throws Exception {
+        Thread main = Thread.currentThread();
+        for (int round = 0; round < rounds; round++) {
+            Provider provider = new Provider("p", ""); CodeScope scope = providerScope(provider); Counting counting = new Counting();
+            if (inflated) inflate(scope);
+            AtomicInteger violations = new AtomicInteger(); AtomicBoolean closeReturned = new AtomicBoolean(), rejectedSeen = new AtomicBoolean();
+            provider.onClose = () -> {
+                if (counting.inFlight.get() != 0) violations.incrementAndGet();
+                if (Thread.currentThread() != main && !Counting.ADMITTED.get()) violations.incrementAndGet();
+                counting.providerClosed.set(true);
+            };
+            MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Counting.class.getName(), "run", "I"))).requireSingle());
+            CountDownLatch running = new CountDownLatch(4); List<Thread> workers = new ArrayList<>(); AtomicReference<Throwable> failure = new AtomicReference<>();
+            for (int w = 0; w < 4; w++) {
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                Thread worker = new Thread(() -> {
+                    boolean first = true;
+                    try {
+                        for (;;) {
+                            if (System.nanoTime() > deadline) { violations.incrementAndGet(); return; }
+                            boolean afterRejection = rejectedSeen.get(), late = closeReturned.get(); Counting.ADMITTED.set(false);
+                            try { plan.invoke(counting, new Object[0]); }
+                            catch (StalePlanException stale) { rejectedSeen.set(true); if (Counting.ADMITTED.get()) violations.incrementAndGet(); return; }
+                            if (late || afterRejection) violations.incrementAndGet();
+                            if (first) { first = false; running.countDown(); }
+                        }
+                    } catch (Throwable error) { failure.set(error); }
+                    finally { if (first) running.countDown(); }
+                });
+                worker.setDaemon(true); workers.add(worker); worker.start();
+            }
+            await(running); for (int spin = round % 7; spin > 0; spin--) Thread.yield();
+            scope.close(); closeReturned.set(true);
+            for (Thread worker : workers) { worker.join(6000); check(!worker.isAlive(), "worker stopped after close"); }
+            eq(null, failure.get()); eq(0, violations.get()); eq(0, counting.enteredAfterProviderClose.get());
+            eq(1, provider.closes.get()); eq(CodeScope.State.CLOSED, scope.state()); eq(0L, scope.diagnostics().get("inFlight"));
+        }
+    }
+    private static Field field(Class<?> owner, String name) throws NoSuchFieldException { Field field = owner.getDeclaredField(name); field.setAccessible(true); return field; }
+    private static AtomicIntegerArray cells(CodeScope scope) throws ReflectiveOperationException { return (AtomicIntegerArray) field(CodeScope.class, "cells").get(scope); }
+    private static AtomicIntegerArray cellsOrNull(CodeScope scope) { try { return cells(scope); } catch (ReflectiveOperationException e) { throw new AssertionError(e); } }
+    /** White-box: the same inflation a failed base CAS triggers, so cell paths are exercised deterministically. */
+    private static void inflate(CodeScope scope) throws ReflectiveOperationException {
+        Method inflate = CodeScope.class.getDeclaredMethod("inflate"); inflate.setAccessible(true); inflate.invoke(scope); check(cells(scope) != null, "inflated");
+    }
+    private static long cellCounts(CodeScope scope) throws ReflectiveOperationException {
+        AtomicIntegerArray table = cells(scope); int count = (Integer) field(CodeScope.class, "CELLS").get(null), stride = (Integer) field(CodeScope.class, "STRIDE").get(null); long total = 0;
+        for (int cell = 1; cell <= count; cell++) total += table.get(cell * stride) & Integer.MAX_VALUE;
+        return total;
     }
     private static void recentHitContracts() {
         test("recent-hit-memo-counts-and-keeps-lru", () -> {
