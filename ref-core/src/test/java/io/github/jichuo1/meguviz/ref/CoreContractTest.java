@@ -7,6 +7,7 @@ import io.github.jichuo1.meguviz.ref.api.result.*;
 import io.github.jichuo1.meguviz.ref.runtime.invoke.*;
 import io.github.jichuo1.meguviz.ref.runtime.resolve.*;
 import io.github.jichuo1.meguviz.ref.scope.CodeScope;
+import io.github.jichuo1.meguviz.ref.scope.RawResolution;
 import io.github.jichuo1.meguviz.ref.spi.*;
 import java.io.*;
 import java.lang.ref.WeakReference;
@@ -35,6 +36,11 @@ public final class CoreContractTest {
         providerContracts();
         providerArityContracts();
         concurrencyContracts();
+        scopeFastPathContracts();
+        memberTableContracts();
+        recentHitContracts();
+        descriptorFastPathContracts();
+        apiAdditionContracts();
         if (args.length > 0) {
             Path output = Path.of(args[0]); Files.createDirectories(output.toAbsolutePath().getParent());
             Files.writeString(output, "<?xml version=\"1.0\" encoding=\"UTF-8\"?><testsuite name=\"MeguvizRef.CoreContracts\" tests=\"" + count + "\" failures=\"" + failures + "\">" + String.join("", xml) + "</testsuite>");
@@ -805,6 +811,528 @@ public final class CoreContractTest {
             check(caught == original, "fatal cleanup propagates during target invocation"); eq(1, provider.closes.get()); eq(CodeScope.State.CLOSED, scope.state());
         });
     }
+    private static void scopeFastPathContracts() {
+        test("lock-free-admission-close-drains-admitted-calls-before-provider-close", () -> {
+            Provider provider = new Provider("p", ""); CodeScope scope = providerScope(provider); ExecutorService executor = Executors.newFixedThreadPool(3);
+            Blocking[] targets = {new Blocking(), new Blocking(), new Blocking()};
+            try {
+                MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Blocking.class.getName(), "run", "I"))).requireSingle());
+                List<Future<Object>> calls = new ArrayList<>();
+                for (Blocking target : targets) { calls.add(executor.submit(() -> plan.invoke(target, new Object[0]))); await(target.entered); }
+                eq(3L, scope.diagnostics().get("inFlight"));
+                scope.close(); eq(CodeScope.State.RETIRING, scope.state()); eq(0, provider.closes.get());
+                Blocking late = new Blocking(); late.exit.countDown();
+                eq("scope identity or epoch is stale", expect(StalePlanException.class, () -> plan.invoke(late, new Object[0])).getMessage());
+                eq(1L, late.entered.getCount()); eq(3L, scope.diagnostics().get("inFlight"));
+                targets[0].exit.countDown(); eq(1, calls.get(0).get(3, TimeUnit.SECONDS));
+                targets[1].exit.countDown(); eq(1, calls.get(1).get(3, TimeUnit.SECONDS));
+                eq(0, provider.closes.get()); eq(CodeScope.State.RETIRING, scope.state()); eq(1L, scope.diagnostics().get("inFlight"));
+                targets[2].exit.countDown(); eq(1, calls.get(2).get(3, TimeUnit.SECONDS));
+                eq(1, provider.closes.get()); eq(CodeScope.State.CLOSED, scope.state()); eq(0L, scope.diagnostics().get("inFlight"));
+                scope.close(); eq(1, provider.closes.get());
+            } finally { for (Blocking target : targets) target.exit.countDown(); scope.close(); executor.shutdownNow(); }
+        });
+        test("lock-free-admission-close-race-stress", () -> {
+            Thread main = Thread.currentThread();
+            for (int round = 0; round < 150; round++) {
+                Provider provider = new Provider("p", ""); CodeScope scope = providerScope(provider); Counting counting = new Counting();
+                AtomicInteger violations = new AtomicInteger(); AtomicBoolean closeReturned = new AtomicBoolean();
+                provider.onClose = () -> {
+                    if (counting.inFlight.get() != 0) violations.incrementAndGet();
+                    if (Thread.currentThread() != main && !Counting.ADMITTED.get()) violations.incrementAndGet();
+                    counting.providerClosed.set(true);
+                };
+                MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Counting.class.getName(), "run", "I"))).requireSingle());
+                CountDownLatch running = new CountDownLatch(4); List<Thread> workers = new ArrayList<>(); AtomicReference<Throwable> failure = new AtomicReference<>();
+                for (int w = 0; w < 4; w++) {
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                    Thread worker = new Thread(() -> {
+                        boolean first = true;
+                        try {
+                            for (;;) {
+                                if (System.nanoTime() > deadline) { violations.incrementAndGet(); return; }
+                                boolean late = closeReturned.get(); Counting.ADMITTED.set(false);
+                                try { plan.invoke(counting, new Object[0]); } catch (StalePlanException stale) { if (Counting.ADMITTED.get()) violations.incrementAndGet(); return; }
+                                if (late) violations.incrementAndGet();
+                                if (first) { first = false; running.countDown(); }
+                            }
+                        } catch (Throwable error) { failure.set(error); }
+                        finally { if (first) running.countDown(); }
+                    });
+                    worker.setDaemon(true); workers.add(worker); worker.start();
+                }
+                await(running); for (int spin = round % 7; spin > 0; spin--) Thread.yield();
+                scope.close(); closeReturned.set(true);
+                for (Thread worker : workers) { worker.join(3000); check(!worker.isAlive(), "worker stopped after close"); }
+                eq(null, failure.get()); eq(0, violations.get()); eq(0, counting.enteredAfterProviderClose.get());
+                eq(1, provider.closes.get()); eq(CodeScope.State.CLOSED, scope.state()); eq(0L, scope.diagnostics().get("inFlight"));
+            }
+        });
+        test("lock-free-admission-epoch-race", () -> {
+            for (int round = 0; round < 50; round++) {
+                try (CodeScope scope = CodeScope.open(LOADER)) {
+                    Counting counting = new Counting(); AtomicBoolean advanced = new AtomicBoolean(); AtomicInteger violations = new AtomicInteger();
+                    MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Counting.class.getName(), "run", "I"))).requireSingle());
+                    CountDownLatch running = new CountDownLatch(3); List<Thread> workers = new ArrayList<>(); AtomicReference<Throwable> failure = new AtomicReference<>();
+                    for (int w = 0; w < 3; w++) {
+                        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                        Thread worker = new Thread(() -> {
+                            boolean first = true;
+                            try {
+                                for (;;) {
+                                    if (System.nanoTime() > deadline) { violations.incrementAndGet(); return; }
+                                    boolean late = advanced.get();
+                                    try { plan.invoke(counting, new Object[0]); } catch (StalePlanException stale) { return; }
+                                    if (late) violations.incrementAndGet();
+                                    if (first) { first = false; running.countDown(); }
+                                }
+                            } catch (Throwable error) { failure.set(error); }
+                            finally { if (first) running.countDown(); }
+                        });
+                        worker.setDaemon(true); workers.add(worker); worker.start();
+                    }
+                    await(running); scope.advanceCodeEpoch("race"); advanced.set(true);
+                    for (Thread worker : workers) { worker.join(3000); check(!worker.isAlive(), "worker stopped after epoch"); }
+                    eq(null, failure.get()); eq(0, violations.get()); eq(0L, scope.diagnostics().get("inFlight")); eq(CodeScope.State.OPEN, scope.state());
+                    eq(1, scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Counting.class.getName(), "run", "I"))).requireSingle()).invoke(counting, new Object[0]));
+                }
+            }
+        });
+        test("slot-table-indexing-across-epochs-and-forged-tokens", () -> {
+            CodeScope scope = CodeScope.open(LOADER);
+            try {
+                ResolutionResult all = scope.resolve(QuerySpec.builder(String.class, MemberKind.METHOD).selection(Selection.ALL).build());
+                eq(ResolutionStatus.ALL_MATCHES, all.status()); int n = all.members().size(); check(n > 127, "beyond the small Long cache: " + n);
+                for (int i = 0; i < n; i++) {
+                    ResolvedMember token = all.members().get(i); eq((long) i + 1, token.slot());
+                    eq(token.descriptor(), MemberDescriptor.from(scope.exportRaw(token)));
+                }
+                MethodPlan before = scope.bindMethod(scope.resolve(QuerySpec.exact(descriptor("zero", "I"))).requireSingle()); eq(0, before.invoke(new Target(), new Object[0]));
+                scope.advanceCodeEpoch("slot table");
+                ResolvedMember zero = scope.resolve(QuerySpec.exact(descriptor("zero", "I"))).requireSingle();
+                eq((long) n + 2, zero.slot()); eq(1L, zero.codeEpoch()); eq(0, scope.bindMethod(zero).invoke(new Target(), new Object[0]));
+                eq("scope identity or epoch is stale", expect(StalePlanException.class, () -> before.invoke(new Target(), new Object[0])).getMessage());
+                String id = scope.identity();
+                for (long slot : new long[]{n + 1, n + 3, 0, -1, Long.MAX_VALUE, Long.MIN_VALUE}) {
+                    eq("binding no longer exists", expect(StalePlanException.class, () -> scope.exportRaw(new ResolvedMember(id, 1, slot, zero.descriptor()))).getMessage());
+                }
+                eq("binding descriptor mismatch", expect(StalePlanException.class, () -> scope.exportRaw(new ResolvedMember(id, 1, zero.slot(), descriptor("one", "I", "I")))).getMessage());
+                check(zero.descriptor() != descriptor("zero", "I") && zero.descriptor().equals(descriptor("zero", "I")), "fixture");
+                eq(Target.class.getDeclaredMethod("zero"), scope.exportRaw(new ResolvedMember(new String(id), 1, zero.slot(), descriptor("zero", "I"))));
+                eq("scope identity or epoch is stale", expect(StalePlanException.class, () -> scope.exportRaw(new ResolvedMember(id, 0, zero.slot(), zero.descriptor()))).getMessage());
+                scope.close();
+                eq("scope identity or epoch is stale", expect(StalePlanException.class, () -> scope.exportRaw(zero)).getMessage());
+                eq(0L, scope.diagnostics().get("bindings"));
+            } finally { scope.close(); }
+        });
+        test("scope-identity-unique-uuid-text", () -> {
+            Set<String> identities = new HashSet<>();
+            for (int i = 0; i < 2000; i++) {
+                CodeScope scope = CodeScope.open(LOADER); String id = scope.identity();
+                eq(id, UUID.fromString(id).toString()); identities.add(id); scope.close(); eq(id, scope.identity());
+            }
+            eq(2000, identities.size());
+        });
+        test("lazy-resolver-diagnostics-shape", () -> {
+            List<String> keys = Arrays.asList("cacheHits", "cachedQueries", "bindings", "schemas", "parameterReads", "candidateChecks", "lookups", "inFlight");
+            CodeScope scope = CodeScope.open(LOADER);
+            eq(keys, new ArrayList<>(scope.diagnostics().keySet())); for (long value : scope.diagnostics().values()) eq(0L, value);
+            scope.resolve(QuerySpec.exact(descriptor("zero", "I"))).requireSingle(); eq(1L, scope.diagnostics().get("lookups")); eq(1L, scope.diagnostics().get("bindings"));
+            scope.advanceCodeEpoch("lazy"); eq(keys, new ArrayList<>(scope.diagnostics().keySet())); for (long value : scope.diagnostics().values()) eq(0L, value);
+            scope.close(); for (long value : scope.diagnostics().values()) eq(0L, value);
+            CodeScope unused = CodeScope.open(LOADER); unused.advanceCodeEpoch("never resolved"); eq(1L, unused.codeEpoch()); unused.close(); eq(CodeScope.State.CLOSED, unused.state());
+        });
+    }
+    private static void recentHitContracts() {
+        test("recent-hit-memo-counts-and-keeps-lru", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 2)) {
+                QuerySpec a = QuerySpec.method(Target.class, "zero"), b = QuerySpec.method(Target.class, "one", int.class), c = QuerySpec.exact(descriptor("zero", "I")); // same member as a: no new binding
+                ResolutionResult ra = scope.resolve(a), rb = scope.resolve(b);
+                for (int i = 0; i < 5; i++) { check(scope.resolve(b) == rb, "memo hit"); check(scope.resolve(QuerySpec.method(Target.class, "one", int.class)) == rb, "equal query hit"); }
+                eq(10L, scope.diagnostics().get("cacheHits"));
+                check(scope.resolve(a) == ra, "older entry hit"); eq(11L, scope.diagnostics().get("cacheHits"));
+                eq(ResolutionStatus.RESOLVED, scope.resolve(c).status()); eq(2L, scope.diagnostics().get("cachedQueries")); eq(2L, scope.diagnostics().get("bindings")); // evicts b, the least recently used
+                long lookups = scope.diagnostics().get("lookups"); scope.resolve(b); eq(lookups + 1, scope.diagnostics().get("lookups"));
+                check(scope.resolve(QuerySpec.method(Target.class, "one", int.class)).members().get(0).slot() == rb.members().get(0).slot(), "same binding after re-resolve");
+            }
+        });
+        test("recent-hit-memo-follows-lru-tail", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 2)) {
+                QuerySpec a = QuerySpec.method(Target.class, "zero"), b = QuerySpec.method(Target.class, "one", int.class), c = QuerySpec.exact(descriptor("zero", "I"));
+                ResolutionResult ra = scope.resolve(a), rb = scope.resolve(b);
+                check(scope.resolve(a) == ra, "a hit"); check(scope.resolve(b) == rb, "b hit"); check(scope.resolve(b) == rb, "b memo hit");
+                eq(ResolutionStatus.RESOLVED, scope.resolve(c).status()); // evicts a: b was used after a
+                long lookups = scope.diagnostics().get("lookups");
+                check(scope.resolve(b) == rb, "b still cached"); eq(lookups, scope.diagnostics().get("lookups"));
+                scope.resolve(a); eq(lookups + 1, scope.diagnostics().get("lookups"));
+            }
+        });
+        test("recent-hit-memo-interrupt-closed-and-epoch", () -> {
+            CodeScope scope = CodeScope.open(LOADER); QuerySpec query = QuerySpec.method(Target.class, "zero"); ResolutionResult first = scope.resolve(query);
+            check(scope.resolve(query) == first, "memo");
+            try { Thread.currentThread().interrupt(); eq(ResolutionStatus.CANCELLED, scope.resolve(query).status()); check(Thread.currentThread().isInterrupted(), "flag kept"); } finally { Thread.interrupted(); }
+            scope.advanceCodeEpoch("memo"); ResolutionResult second = scope.resolve(query); check(second != first, "epoch cleared memo"); eq(1L, second.members().get(0).codeEpoch());
+            scope.close(); ResolutionResult stale = scope.resolve(query); eq(ResolutionStatus.STALE, stale.status()); eq("scope_closed", stale.receipt().reason());
+        });
+        test("recent-hit-memo-close-race", () -> {
+            for (int round = 0; round < 100; round++) {
+                CodeScope scope = CodeScope.open(LOADER); QuerySpec query = QuerySpec.method(Target.class, "zero"); ResolutionResult cached = scope.resolve(query);
+                AtomicBoolean closed = new AtomicBoolean(); AtomicInteger violations = new AtomicInteger(); AtomicLong hits = new AtomicLong();
+                CountDownLatch running = new CountDownLatch(4); List<Thread> workers = new ArrayList<>();
+                for (int w = 0; w < 4; w++) {
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                    Thread worker = new Thread(() -> {
+                        boolean first = true;
+                        for (;;) {
+                            if (System.nanoTime() > deadline) { violations.incrementAndGet(); if (first) running.countDown(); return; }
+                            boolean late = closed.get(); ResolutionResult result = scope.resolve(query);
+                            if (result == cached) { hits.incrementAndGet(); if (late) violations.incrementAndGet(); }
+                            else if (result.status() == ResolutionStatus.STALE) { if (first) running.countDown(); return; }
+                            else violations.incrementAndGet();
+                            if (first) { first = false; running.countDown(); }
+                        }
+                    });
+                    worker.setDaemon(true); workers.add(worker); worker.start();
+                }
+                await(running); scope.close(); closed.set(true);
+                for (Thread worker : workers) { worker.join(3000); check(!worker.isAlive(), "worker stopped"); }
+                eq(0, violations.get()); eq(hits.get(), scope.diagnostics().get("cacheHits"));
+            }
+        });
+    }
+    private static void memberTableContracts() {
+        test("member-table-cache-structural-results-identical-to-fresh-scopes", () -> {
+            List<QuerySpec> queries = new ArrayList<>();
+            for (Class<?> owner : new Class<?>[]{Target.class, Child.class, ArityFixture.class})
+                for (MemberKind kind : MemberKind.values())
+                    for (Hierarchy hierarchy : Hierarchy.values())
+                        for (Selection selection : new Selection[]{Selection.UNIQUE, Selection.FIRST, Selection.ALL})
+                            for (String name : new String[]{null, "pick", "shadow", "choose", "hashCode", "<init>", "first", "covariant"}) {
+                                if (kind == MemberKind.CONSTRUCTOR && hierarchy != Hierarchy.DECLARED) continue;
+                                QuerySpec.Builder builder = QuerySpec.builder(owner, kind).hierarchy(hierarchy).selection(selection);
+                                if (name != null) builder.name(name);
+                                queries.add(builder.build());
+                                queries.add(builder.parameterCount(1).build());
+                            }
+            try (CodeScope shared = CodeScope.open(LOADER)) {
+                for (int pass = 0; pass < 2; pass++) for (QuerySpec query : queries) {
+                    try (CodeScope fresh = CodeScope.open(LOADER)) {
+                        ResolutionResult expected = fresh.resolve(query), actual = shared.resolve(query);
+                        String label = query.summary();
+                        eq(expected.status(), actual.status()); eq(expected.receipt().reason(), actual.receipt().reason());
+                        eq(expected.receipt().coverage().complete(), actual.receipt().coverage().complete());
+                        eq(expected.receipt().coverage().inspected(), actual.receipt().coverage().inspected());
+                        eq(expected.receipt().descriptors(), actual.receipt().descriptors());
+                        eq(expected.members().size(), actual.members().size());
+                        for (int i = 0; i < expected.members().size(); i++) check(fresh.exportRaw(expected.members().get(i)).equals(shared.exportRaw(actual.members().get(i))), "same member order: " + label);
+                    }
+                }
+                check(memberTables(shared) > 0, "tables retained in shared scope");
+            }
+        });
+        test("member-table-cache-first-keeps-reflection-order", () -> {
+            List<Method> expected = new ArrayList<>(); for (Method m : Target.class.getDeclaredMethods()) if (m.getName().equals("pick")) expected.add(m);
+            try (CodeScope scope = CodeScope.open(LOADER)) {
+                scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").build()).requireSingle();
+                eq(Target.class.getDeclaredMethods().length, memberTables(scope));
+                eq(expected.get(0), scope.exportRaw(scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").selection(Selection.FIRST).build()).requireSingle()));
+                ResolutionResult all = scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").selection(Selection.ALL).build());
+                for (int i = 0; i < expected.size(); i++) eq(expected.get(i), scope.exportRaw(all.members().get(i)));
+                eq(Target.class.getDeclaredMethods().length, memberTables(scope));
+            }
+        });
+        test("member-table-cache-bounded-by-capacity-lru", () -> {
+            int target = Target.class.getDeclaredMethods().length, arity = ArityFixture.class.getDeclaredMethods().length, child = Child.class.getDeclaredMethods().length;
+            try (CodeScope small = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, target - 1)) {
+                small.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").build()).requireSingle(); eq(0, memberTables(small));
+                small.resolve(QuerySpec.builder(Child.class, MemberKind.METHOD).name("covariant").bridge(false).build()).requireSingle(); eq(child, memberTables(small));
+            }
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, target + arity)) {
+                scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").selection(Selection.ALL).build()); eq(target, memberTables(scope));
+                scope.resolve(QuerySpec.builder(ArityFixture.class, MemberKind.METHOD).name("choose").parameterCount(0).build()).requireSingle(); eq(target + arity, memberTables(scope));
+                scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("one").build()).requireSingle(); // touch: Target becomes most recent
+                scope.resolve(QuerySpec.builder(Child.class, MemberKind.METHOD).name("covariant").bridge(false).build()).requireSingle();
+                eq(target + child, memberTables(scope)); // eldest ArityFixture table evicted
+                scope.resolve(QuerySpec.builder(EmptyTarget.class, MemberKind.FIELD).build());
+                check(memberTables(scope) <= target + arity, "bounded");
+            }
+        });
+        test("member-table-cache-cleared-by-epoch-and-close", () -> {
+            CodeScope scope = CodeScope.open(LOADER);
+            scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").build()).requireSingle(); check(memberTables(scope) > 0, "retained");
+            scope.advanceCodeEpoch("tables"); eq(0, memberTables(scope));
+            scope.resolve(QuerySpec.builder(Target.class, MemberKind.FIELD).name("number").build()).requireSingle(); eq(Target.class.getDeclaredFields().length, memberTables(scope));
+            scope.close(); eq(0, memberTables(scope));
+        });
+        test("member-table-cache-no-negative-caching-of-failed-enumeration", () -> {
+            try (URLClassLoader loader = isolated(missing); CodeScope scope = CodeScope.open(loader)) {
+                QuerySpec query = QuerySpec.builder("fixture.MissingSignatureFixture", MemberKind.METHOD).name("available").build();
+                for (int i = 0; i < 3; i++) { ResolutionResult result = scope.resolve(query); eq(ResolutionStatus.PARTIAL, result.status()); check(!result.receipt().coverage().complete(), "unknown signature"); }
+                eq(0, memberTables(scope));
+            }
+        });
+        test("member-table-cache-concurrent-different-queries-same-owner", () -> {
+            ExecutorService executor = Executors.newFixedThreadPool(4);
+            try (CodeScope scope = CodeScope.open(LOADER)) {
+                List<Callable<Method>> work = new ArrayList<>();
+                String[] names = {"zero", "one", "four", "eight", "wide", "varargs", "nullable", "throwOnce"};
+                for (int round = 0; round < 8; round++) for (String name : names) {
+                    QuerySpec query = QuerySpec.builder(Target.class, MemberKind.METHOD).name(name).candidateBudget(1000 + round).build();
+                    work.add(() -> (Method) scope.exportRaw(scope.resolve(query).requireSingle()));
+                }
+                List<Future<Method>> results = executor.invokeAll(work);
+                for (int i = 0; i < results.size(); i++) eq(names[i % names.length], results.get(i).get(3, TimeUnit.SECONDS).getName());
+                eq(Target.class.getDeclaredMethods().length, memberTables(scope));
+                eq((long) names.length, scope.diagnostics().get("bindings"));
+            } finally { executor.shutdownNow(); }
+        });
+    }
+    private static void descriptorFastPathContracts() {
+        test("type-descriptor-validation-matches-previous-implementation", () -> {
+            List<String> corpus = new ArrayList<>(Arrays.asList("", "V", "Z", "I", "D", "X", "L", "L;", "La;", "[I", "[V", "[[V", "[", "[[", "[L;", "[La;", "[[Ljava/lang/String;",
+                    "Ljava/lang/String;", "Ljava.lang.String;", "L/a;", "La/;", "La//b;", "La/b;;", "La;b;", "La[b;", "La(b;", "La)b;", "La b;", "La\tb;", "La\u2003b;", "La\u00a0b;",
+                    "La/b", "a/b;", "II", "IV", "VV", "(I)V", "L//;", "L/;", "Lx;y", "[" .repeat(255) + "I", "[".repeat(256) + "I", "[".repeat(255) + "V", "L" + "a".repeat(4094) + ";", "L" + "a".repeat(4095) + ";",
+                    "La$b;", "La/b$0x1;", "Lcom/example/Foo/0x0000000800c00400;", "L\u00e9;", "[Lx//y;", "[L/x;"));
+            Random random = new Random(42); String alphabet = "[L;/.()VIZa b$";
+            for (int i = 0; i < 20000; i++) { StringBuilder value = new StringBuilder(); int length = random.nextInt(9); for (int c = 0; c < length; c++) value.append(alphabet.charAt(random.nextInt(alphabet.length()))); corpus.add(value.toString()); }
+            for (String value : corpus) eq(outcome(() -> previousTypeOf(value)), outcome(() -> TypeDescriptor.of(value).value()));
+            eq(outcome(() -> previousTypeOf(null)), outcome(() -> TypeDescriptor.of(null).value()));
+            for (Class<?> type : new Class<?>[]{void.class, boolean.class, byte.class, char.class, short.class, int.class, long.class, float.class, double.class, String.class, int[].class, String[][].class, Map.Entry.class})
+                eq(previousTypeOf(type.isArray() ? type.getName().replace('.', '/') : type.isPrimitive() ? TypeDescriptor.fromClass(type).value() : "L" + type.getName().replace('.', '/') + ";"), TypeDescriptor.fromClass(type).value());
+        });
+        test("owner-normalization-matches-previous-implementation", () -> {
+            Runnable lambda = () -> { };
+            String hidden = lambda.getClass().getName(); check(hidden.indexOf('/') > 0, "lambda proxy is a hidden class: " + hidden);
+            for (String owner : new String[]{"java.lang.String", "java/lang/String", "a.b/c", hidden, "a..b", "a//b", ".a", "a.", "/a", "a/", "a;b", "a b", "a[]", "", "x".repeat(4094), "x".repeat(4095)}) {
+                eq(outcome(() -> previousOwner(owner)), outcome(() -> MemberDescriptor.field(owner, "f", "I").owner()));
+                eq(outcome(() -> previousOwner(owner)), outcome(() -> QuerySpec.builder(owner, MemberKind.FIELD).build().owner()));
+            }
+            Method run = lambda.getClass().getDeclaredMethod("run");
+            eq(previousOwner(hidden), MemberDescriptor.from(run).owner()); eq(MemberDescriptor.from(run), new MethodSchema(run).descriptor());
+        });
+        test("descriptor-from-and-schema-match-string-round-trip", () -> {
+            List<Member> members = new ArrayList<>();
+            for (Class<?> owner : new Class<?>[]{String.class, Target.class, Child.class, Parent.class, ArityFixture.class, HashMap.class, Thread.State.class}) {
+                members.addAll(Arrays.asList(owner.getDeclaredMethods())); members.addAll(Arrays.asList(owner.getDeclaredFields())); members.addAll(Arrays.asList(owner.getDeclaredConstructors()));
+            }
+            for (Member member : members) {
+                MemberDescriptor expected = previousFrom(member), actual = MemberDescriptor.from(member);
+                eq(expected, actual); eq(expected.signature(), actual.signature()); eq(expected.hashCode(), actual.hashCode());
+                eq(Objects.hash(actual.kind(), actual.owner(), actual.name(), actual.parameters(), actual.type()), actual.hashCode()); eq(actual.hashCode(), actual.hashCode());
+                if (!(member instanceof Field)) { MethodSchema schema = new MethodSchema(member); eq(expected, schema.descriptor()); check(schema.rawMember() == member, "raw member"); }
+                expect(UnsupportedOperationException.class, () -> actual.parameters().add(TypeDescriptor.of("I")));
+            }
+        });
+        test("query-summary-memoized-and-unchanged", () -> {
+            QuerySpec query = QuerySpec.builder(Target.class, MemberKind.METHOD).name("four").parameters(int.class, int.class, int.class, int.class).returns(int.class).build();
+            String expected = QuerySpec.RULE_VERSION + ":METHOD:" + Target.class.getName() + ":four:UNIQUE:DECLARED:null:null:null:null:4:16384:4096:256:null:[int, int, int, int]:null:int:null";
+            eq(expected, query.summary()); check(query.summary() == query.summary(), "memoized instance");
+            QuerySpec exact = QuerySpec.exact(descriptor("zero", "I"));
+            eq(QuerySpec.RULE_VERSION + ":METHOD:" + Target.class.getName() + ":zero:EXACT:DECLARED:" + Target.class.getName() + "#zero()I:null:null:null:-1:16384:4096:256:null:null:null:null:null", exact.summary());
+        });
+    }
+    private static void apiAdditionContracts() {
+        test("query-shortcuts-equal-builder-forms", () -> {
+            QuerySpec method = QuerySpec.method(Target.class, "four", int.class, int.class, int.class, int.class);
+            QuerySpec built = QuerySpec.builder(Target.class, MemberKind.METHOD).name("four").parameters(int.class, int.class, int.class, int.class).build();
+            eq(built, method); eq(built.hashCode(), method.hashCode()); eq(built.summary(), method.summary());
+            eq(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").parameters().build(), QuerySpec.method(Target.class, "zero"));
+            eq(QuerySpec.builder(Target.class, MemberKind.FIELD).name("number").build(), QuerySpec.field(Target.class, "number"));
+            eq(QuerySpec.builder(Target.class, MemberKind.CONSTRUCTOR).parameters(int.class).build(), QuerySpec.constructor(Target.class, int.class));
+            eq(0, QuerySpec.constructor(Target.class).parameterCount()); eq(-1, QuerySpec.field(Target.class, "number").parameterCount());
+            expect(IllegalArgumentException.class, () -> QuerySpec.method(Target.class, null)); expect(IllegalArgumentException.class, () -> QuerySpec.method(Target.class, "four", (Class<?>) null));
+            expect(IllegalArgumentException.class, () -> QuerySpec.field(Target.class, "")); expect(NullPointerException.class, () -> QuerySpec.method(null, "x"));
+        });
+        test("bind-query-shortcuts-require-single", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER)) {
+                eq("string", scope.bindMethod(QuerySpec.method(Target.class, "pick", String.class)).call(new Target(), "x"));
+                eq(ResolutionStatus.AMBIGUOUS, expect(ResolutionException.class, () -> scope.bindMethod(QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").build())).status());
+                eq(ResolutionStatus.NOT_FOUND_IN_VISIBLE_UNIVERSE, expect(ResolutionException.class, () -> scope.bindMethod(QuerySpec.method(Target.class, "pick", Object.class))).status());
+                Target target = new Target(); FieldPlan field = scope.bindField(QuerySpec.field(Target.class, "number")); field.set(target, 7); eq(7, field.get(target));
+                eq(5, ((Target) scope.bindConstructor(QuerySpec.constructor(Target.class, int.class)).create(5)).number);
+                expect(IllegalArgumentException.class, () -> scope.bindMethod(QuerySpec.field(Target.class, "number")));
+            }
+            CodeScope closed = CodeScope.open(LOADER); closed.close();
+            eq(ResolutionStatus.STALE, expect(ResolutionException.class, () -> closed.bindMethod(QuerySpec.method(Target.class, "zero"))).status());
+        });
+        test("plan-varargs-call-matches-invoke", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER)) {
+                MethodPlan four = scope.bindMethod(QuerySpec.method(Target.class, "four", int.class, int.class, int.class, int.class));
+                MethodPlan varargs = scope.bindMethod(QuerySpec.method(Target.class, "varargs", String[].class));
+                MethodPlan zero = scope.bindMethod(QuerySpec.method(Target.class, "zero")), fail = scope.bindMethod(QuerySpec.method(Target.class, "throwOnce"));
+                Target target = new Target();
+                eq(10, four.call(target, 1, 2, 3, 4)); eq(10, four.call(target, new Object[]{1, 2, 3, 4})); eq(0, zero.call(target));
+                eq(2, varargs.call(target, (Object) new String[]{"a", "b"}));
+                Object[][] cases = {{null, new Object[]{1, 2, 3, 4}}, {target, new Object[]{1, 2, 3}}, {target, new Object[]{1, "2", 3, 4}}, {"wrong", new Object[]{1, 2, 3, 4}}, {target, null}};
+                for (Object[] item : cases) eq(failureType(() -> four.invoke(item[0], (Object[]) item[1])), failureType(() -> four.call(item[0], (Object[]) item[1])));
+                eq(failureType(() -> fail.invoke(target, new Object[0])), failureType(() -> fail.call(target))); eq(2, target.calls);
+                ConstructorPlan constructor = scope.bindConstructor(QuerySpec.constructor(Target.class, int.class));
+                eq(failureType(() -> constructor.newInstance(new Object[]{-1})), failureType(() -> constructor.create(-1)));
+                eq(failureType(() -> constructor.newInstance(new Object[0])), failureType(() -> constructor.create()));
+                scope.close(); expect(StalePlanException.class, () -> four.call(target, 1, 2, 3, 4)); expect(StalePlanException.class, () -> constructor.create(1));
+            }
+        });
+        test("open-with-policy-uses-default-capacity", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.TRY_SUPPRESS_JAVA_CHECKS)) {
+                eq(AccessPolicy.TRY_SUPPRESS_JAVA_CHECKS, scope.accessPolicy());
+                Field capacity = CodeScope.class.getDeclaredField("capacity"); capacity.setAccessible(true); eq(4096, capacity.getInt(scope));
+                eq(42, scope.bindMethod(QuerySpec.method(Target.class, "privateValue")).call(new Target()));
+            }
+            expect(NullPointerException.class, () -> CodeScope.open(LOADER, null));
+        });
+        test("is-current-equals-three-separate-checks", () -> {
+            ClassLoader other = new URLClassLoader(new URL[0], null);
+            CodeScope scope = CodeScope.open(LOADER);
+            try {
+                for (int phase = 0; phase < 3; phase++) {
+                    if (phase == 1) scope.advanceCodeEpoch("is-current");
+                    if (phase == 2) scope.close();
+                    String id = scope.identity(); long epoch = scope.codeEpoch();
+                    for (ClassLoader loader : new ClassLoader[]{LOADER, other, null})
+                        for (String identity : new String[]{id, new String(id), "other", null})
+                            for (long candidate : new long[]{epoch, epoch + 1, epoch - 1})
+                                eq(scope.usesLoader(loader) && scope.identity().equals(identity) && scope.codeEpoch() == candidate, scope.isCurrent(loader, identity, candidate));
+                    eq(phase < 2, scope.isCurrent(LOADER, id, epoch));
+                }
+                try (CodeScope nullLoader = CodeScope.open(null)) { check(nullLoader.isCurrent(null, nullLoader.identity(), 0), "bootstrap loader scope"); }
+            } finally { scope.close(); }
+        });
+        test("resolve-raw-matches-resolve-without-bindings-or-cache", () -> {
+            List<QuerySpec> queries = Arrays.asList(
+                    QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").selection(Selection.ALL).build(),
+                    QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").build(),
+                    QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").selection(Selection.FIRST).build(),
+                    QuerySpec.builder(Target.class, MemberKind.METHOD).name("noSuchMethod").build(),
+                    QuerySpec.builder(Target.class, MemberKind.METHOD).name("noSuchMethod").candidateBudget(1).build(),
+                    QuerySpec.builder(Child.class, MemberKind.METHOD).name("hashCode").parameters().hierarchy(Hierarchy.SUPERCLASSES).build(),
+                    QuerySpec.builder(Child.class, MemberKind.FIELD).name("shadow").hierarchy(Hierarchy.SUPERCLASSES).build(),
+                    QuerySpec.builder("missing.Owner", MemberKind.METHOD).name("x").build(),
+                    QuerySpec.exact(descriptor("four", "I", "I", "I", "I", "I")), QuerySpec.exact(descriptor("four", "J", "I", "I", "I", "I")),
+                    QuerySpec.constructor(Target.class, int.class), QuerySpec.field(Target.class, "number"));
+            try (CodeScope raw = CodeScope.open(LOADER)) {
+                for (int pass = 0; pass < 2; pass++) for (QuerySpec query : queries) {
+                    try (CodeScope tokens = CodeScope.open(LOADER)) {
+                        ResolutionResult expected = tokens.resolve(query); RawResolution actual = raw.resolveRaw(query);
+                        eq(expected.status(), actual.status()); eq(expected.receipt().reason(), actual.receipt().reason());
+                        eq(expected.receipt().querySummary(), actual.receipt().querySummary()); eq(expected.receipt().selection(), actual.receipt().selection());
+                        eq(expected.receipt().coverage().complete(), actual.receipt().coverage().complete()); eq(expected.receipt().coverage().inspected(), actual.receipt().coverage().inspected());
+                        eq(expected.receipt().coverage().universe(), actual.receipt().coverage().universe()); eq(expected.receipt().descriptors(), actual.receipt().descriptors());
+                        eq(expected.receipt().causeType(), actual.receipt().causeType()); eq(ResolutionReceipt.InterruptionOrigin.UNKNOWN, actual.receipt().interruptionOrigin());
+                        eq(expected.members().size(), actual.members().size());
+                        for (int i = 0; i < expected.members().size(); i++) eq(tokens.exportRaw(expected.members().get(i)), actual.members().get(i));
+                        expect(UnsupportedOperationException.class, () -> actual.members().clear());
+                    }
+                }
+                eq(0L, raw.diagnostics().get("bindings")); eq(0L, raw.diagnostics().get("cachedQueries")); eq(0L, raw.diagnostics().get("cacheHits")); eq(0L, raw.diagnostics().get("inFlight"));
+            }
+        });
+        test("resolve-raw-reuses-cached-token-result", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER)) {
+                QuerySpec query = QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").selection(Selection.ALL).build();
+                ResolutionResult tokens = scope.resolve(query); RawResolution raw = scope.resolveRaw(query);
+                eq(1L, scope.diagnostics().get("cacheHits")); check(raw.receipt() == tokens.receipt(), "same receipt");
+                for (int i = 0; i < tokens.members().size(); i++) check(scope.exportRaw(tokens.members().get(i)) == raw.members().get(i), "slot member instance");
+                eq(2L, scope.diagnostics().get("bindings")); eq(1L, scope.diagnostics().get("cachedQueries"));
+            }
+        });
+        test("resolve-raw-ignores-binding-capacity", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 1)) {
+                scope.bindMethod(QuerySpec.method(Target.class, "zero"));
+                QuerySpec both = QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").selection(Selection.ALL).build();
+                RawResolution raw = scope.resolveRaw(both); eq(ResolutionStatus.ALL_MATCHES, raw.status()); eq(2, raw.members().size()); check(raw.receipt().coverage().complete(), "complete");
+                ResolutionResult tokens = scope.resolve(both); eq(ResolutionStatus.PARTIAL, tokens.status()); eq("binding_capacity", tokens.receipt().reason());
+                eq(1L, scope.diagnostics().get("bindings"));
+                for (int i = 0; i < 5; i++) eq(2, scope.resolveRaw(QuerySpec.builder(Target.class, MemberKind.METHOD).name("pick").selection(Selection.ALL).candidateBudget(100 + i).build()).members().size());
+                eq(1L, scope.diagnostics().get("bindings"));
+            }
+        });
+        test("resolve-raw-applies-access-policy-and-outlives-close", () -> {
+            QuerySpec hidden = QuerySpec.method(Target.class, "privateValue");
+            CodeScope suppress = CodeScope.open(LOADER, AccessPolicy.TRY_SUPPRESS_JAVA_CHECKS);
+            Method open = (Method) suppress.resolveRaw(hidden).members().get(0); check(accessibleFlag(open), "setAccessible applied");
+            suppress.close(); eq(42, open.invoke(new Target()));
+            try (CodeScope preserve = CodeScope.open(LOADER)) { check(!accessibleFlag(preserve.resolveRaw(hidden).members().get(0)), "access unchanged"); }
+        });
+        test("resolve-raw-closed-and-interrupted", () -> {
+            CodeScope scope = CodeScope.open(LOADER);
+            try {
+                Thread.currentThread().interrupt();
+                RawResolution cancelled = scope.resolveRaw(QuerySpec.method(Target.class, "zero"));
+                check(Thread.currentThread().isInterrupted(), "flag preserved"); eq(ResolutionStatus.CANCELLED, cancelled.status()); eq("interrupted", cancelled.receipt().reason()); check(cancelled.members().isEmpty(), "no members");
+            } finally { Thread.interrupted(); }
+            scope.close();
+            RawResolution stale = scope.resolveRaw(QuerySpec.method(Target.class, "zero"));
+            eq(ResolutionStatus.STALE, stale.status()); eq("scope_closed", stale.receipt().reason()); check(stale.members().isEmpty(), "no members");
+        });
+        test("resolve-raw-provider-single-flight-and-drain", () -> {
+            Provider provider = new Provider("p", ""); provider.entered = new CountDownLatch(1); provider.exit = new CountDownLatch(1);
+            CodeScope scope = providerScope(provider); ExecutorService executor = Executors.newFixedThreadPool(2);
+            try {
+                Future<RawResolution> owner = executor.submit(() -> scope.resolveRaw(providerQuery())); await(provider.entered);
+                Future<RawResolution> waiter = executor.submit(() -> scope.resolveRaw(providerQuery()));
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2); while (scope.diagnostics().get("inFlight") < 2 && System.nanoTime() < deadline) Thread.yield();
+                eq(2L, scope.diagnostics().get("inFlight")); provider.exit.countDown();
+                RawResolution first = owner.get(3, TimeUnit.SECONDS), second = waiter.get(3, TimeUnit.SECONDS);
+                eq(ResolutionStatus.RESOLVED, first.status()); check(first == second, "shared flight"); eq(1, provider.discoveries.get());
+                eq(Target.class.getDeclaredMethod("zero"), first.members().get(0)); eq(0L, scope.diagnostics().get("bindings"));
+            } finally { provider.exit.countDown(); scope.close(); executor.shutdownNow(); }
+            Provider blocking = new Provider("p", ""); blocking.entered = new CountDownLatch(1); blocking.exit = new CountDownLatch(1);
+            CodeScope closing = providerScope(blocking); ExecutorService single = Executors.newSingleThreadExecutor();
+            try {
+                Future<RawResolution> inFlight = single.submit(() -> closing.resolveRaw(providerQuery())); await(blocking.entered);
+                closing.close(); eq(CodeScope.State.RETIRING, closing.state()); eq(0, blocking.closes.get());
+                blocking.exit.countDown(); RawResolution late = inFlight.get(3, TimeUnit.SECONDS);
+                eq(ResolutionStatus.STALE, late.status()); eq("scope_invalidated", late.receipt().reason()); check(late.members().isEmpty(), "no members after close");
+                eq(1, blocking.closes.get()); eq(CodeScope.State.CLOSED, closing.state());
+            } finally { blocking.exit.countDown(); closing.close(); single.shutdownNow(); }
+        });
+    }
+    @SuppressWarnings("deprecation") private static boolean accessibleFlag(Member member) { return ((AccessibleObject) member).isAccessible(); }
+    private static String failureType(Checked action) {
+        try { action.run(); return "none"; } catch (Throwable failure) { return failure.getClass().getName() + (failure.getCause() == null ? "" : "<" + failure.getCause().getClass().getName()); }
+    }
+    private static String outcome(Callable<String> action) {
+        try { return "value:" + action.call(); } catch (Exception failure) { return "error:" + failure.getClass().getName() + ":" + failure.getMessage(); }
+    }
+    /** Verbatim behaviour of TypeDescriptor.of in 1.0.0, kept as an independent oracle. */
+    private static String previousTypeOf(String value) {
+        Objects.requireNonNull(value, "descriptor");
+        if (value.length() == 0 || value.length() > 4096) throw new IllegalArgumentException("descriptor length");
+        int dimensions = 0;
+        while (dimensions < value.length() && value.charAt(dimensions) == '[') dimensions++;
+        if (dimensions > 255 || dimensions == value.length()) throw new IllegalArgumentException("array dimensions");
+        String element = value.substring(dimensions);
+        if (element.length() == 1 && "VZBCSIJFD".indexOf(element.charAt(0)) >= 0) {
+            if (dimensions > 0 && element.equals("V")) throw new IllegalArgumentException("void array");
+        } else if (element.startsWith("L") && element.endsWith(";") && element.length() > 2) {
+            String name = element.substring(1, element.length() - 1);
+            if (name.startsWith("/") || name.endsWith("/") || name.contains("//")) throw new IllegalArgumentException("reference name");
+            for (int i = 0; i < name.length(); i++) {
+                char c = name.charAt(i);
+                if (c == '.' || c == ';' || c == '[' || c == '(' || c == ')' || Character.isWhitespace(c)) throw new IllegalArgumentException("reference name");
+            }
+        } else throw new IllegalArgumentException("invalid descriptor: " + value);
+        return value;
+    }
+    private static String previousOwner(String owner) {
+        String value = previousTypeOf("L" + Objects.requireNonNull(owner).replace('.', '/') + ";");
+        return value.substring(1, value.length() - 1).replace('/', '.');
+    }
+    /** The 1.0.0 from(): descriptor strings first, then the validating string factories. */
+    private static MemberDescriptor previousFrom(Member member) {
+        String owner = member.getDeclaringClass().getName();
+        if (member instanceof Field) return MemberDescriptor.field(owner, member.getName(), TypeDescriptor.fromClass(((Field) member).getType()).value());
+        Class<?>[] params = member instanceof Method ? ((Method) member).getParameterTypes() : ((Constructor<?>) member).getParameterTypes();
+        String[] values = new String[params.length];
+        for (int i = 0; i < params.length; i++) values[i] = TypeDescriptor.fromClass(params[i]).value();
+        return member instanceof Method ? MemberDescriptor.method(owner, member.getName(), TypeDescriptor.fromClass(((Method) member).getReturnType()).value(), values) : MemberDescriptor.constructor(owner, values);
+    }
+    private static int memberTables(CodeScope scope) throws ReflectiveOperationException {
+        Field field = CodeScope.class.getDeclaredField("resolver"); field.setAccessible(true);
+        Object resolver = field.get(scope); if (resolver == null) return 0;
+        Field members = ReflectionResolver.class.getDeclaredField("tableMembers"); members.setAccessible(true);
+        synchronized (resolver) { return members.getInt(resolver); }
+    }
     private static int cycle(QueryCoordinator<String,Integer> coordinator, String dependency, CyclicBarrier barrier) {
         try { barrier.await(2,TimeUnit.SECONDS); return coordinator.execute(dependency, () -> 0,1000); } catch (InterruptedException | TimeoutException | BrokenBarrierException e) { throw new AssertionError(e); }
     }
@@ -927,6 +1455,17 @@ public final class CoreContractTest {
     public static final class EmptyTarget { }
     public static class Parent { public int shadow; public Object covariant() { return "parent"; } }
     public static final class Child extends Parent { public String shadow; @Override public String covariant() { return "child"; } }
+    /** Counts entered target calls; ADMITTED marks that the current thread's call reached the target. */
+    public static final class Counting {
+        static final ThreadLocal<Boolean> ADMITTED = ThreadLocal.withInitial(() -> false);
+        final AtomicInteger inFlight = new AtomicInteger(), calls = new AtomicInteger(), enteredAfterProviderClose = new AtomicInteger();
+        final AtomicBoolean providerClosed = new AtomicBoolean();
+        public int run() {
+            ADMITTED.set(true); inFlight.incrementAndGet(); calls.incrementAndGet();
+            try { if (providerClosed.get()) enteredAfterProviderClose.incrementAndGet(); Thread.onSpinWait(); return 1; }
+            finally { inFlight.decrementAndGet(); }
+        }
+    }
     public static final class Blocking { final CountDownLatch entered = new CountDownLatch(1), exit = new CountDownLatch(1); public int run() { entered.countDown(); blockingAwait(exit); return 1; } }
     public static final class ClosingTarget { private final CodeScope scope; ClosingTarget(CodeScope scope) { this.scope=scope; } public void run() { scope.close(); throw new IllegalArgumentException("original target"); } }
     private static final class SyntheticFatal extends VirtualMachineError { }
@@ -949,6 +1488,7 @@ public final class CoreContractTest {
         Provider(String id,String capability) { this.id=id; this.capability=capability; }
         public ProviderDescriptor descriptor() { if (interruptDescriptorAfterDiscovery && discoveries.get() > 0) CoreContractTest.<RuntimeException>sneakyThrow(new InterruptedException("descriptor")); if (interruptFlagDescriptorAfterDiscovery && discoveries.get() > 0) Thread.currentThread().interrupt(); return new ProviderDescriptor(id,"fixture-1",major,0,capability,dependencies); }
         public CandidateBatch discover(CandidateRequest request) throws InterruptedException { discoveries.incrementAndGet(); if (cancel) throw new CancellationException("fixture"); if (entered!=null) entered.countDown(); if (exit!=null) await(exit); if (interruptAfterWait) throw new InterruptedException("provider"); if (interruptBeforeReturn) Thread.currentThread().interrupt(); return new CandidateBatch(candidates,fingerprint,"finite-handwritten-fixture",complete); }
-        public void close() { closes.incrementAndGet(); if (closeOrder != null) closeOrder.add(id); if (clearInterruptOnClose) closeSawInterrupt.set(Thread.interrupted()); if (closeFailure != null) CoreContractTest.<RuntimeException>sneakyThrow(closeFailure); if (failClose) throw new IllegalStateException("provider close"); }
+        Runnable onClose;
+        public void close() { closes.incrementAndGet(); if (onClose != null) onClose.run(); if (closeOrder != null) closeOrder.add(id); if (clearInterruptOnClose) closeSawInterrupt.set(Thread.interrupted()); if (closeFailure != null) CoreContractTest.<RuntimeException>sneakyThrow(closeFailure); if (failClose) throw new IllegalStateException("provider close"); }
     }
 }

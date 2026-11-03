@@ -10,3 +10,5 @@ val profile = providers.gradleProperty("meguviz.profile").orElse("host").get()
 require(profile in setOf("host", "android")) { "meguviz.profile must be host or android" }
 include(":ref-core", ":ref-diagnostics")
 if (profile == "android") include(":ref-android", ":samples:android-consumer")
+// Host JMH microbenchmarks are opt-in so verifyHost/CI configuration stays unchanged.
+if (providers.gradleProperty("meguviz.benchmarks").orNull == "true") include(":benchmark-jvm")

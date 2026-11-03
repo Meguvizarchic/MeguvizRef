@@ -19,6 +19,8 @@ public final class QuerySpec {
     private final int parameterCount, candidateBudget, resultLimit, depthLimit;
     private final String providerId;
     private final int hash;
+    /** Memoized summary(); racy single-check of an immutable String. */
+    private String summary;
     private QuerySpec(Builder b) {
         owner = b.owner; runtimeOwner = b.runtimeOwner; kind = b.kind; name = b.name;
         parameterClasses = b.parameterClasses == null ? null : b.parameterClasses.clone();
@@ -55,6 +57,12 @@ public final class QuerySpec {
         return new Builder(descriptor.owner(), null, descriptor.kind()).exact(descriptor).build();
     }
     public static Builder builder(Class<?> owner, MemberKind kind) { return new Builder(owner.getName(), owner, kind); }
+    /** {@code builder(owner, METHOD).name(name).parameters(parameters).build()}: UNIQUE, DECLARED, exact parameter Class identities. */
+    public static QuerySpec method(Class<?> owner, String name, Class<?>... parameters) { return builder(owner, MemberKind.METHOD).name(name).parameters(parameters).build(); }
+    /** {@code builder(owner, FIELD).name(name).build()}: UNIQUE, DECLARED. */
+    public static QuerySpec field(Class<?> owner, String name) { return builder(owner, MemberKind.FIELD).name(name).build(); }
+    /** {@code builder(owner, CONSTRUCTOR).parameters(parameters).build()}: UNIQUE, exact parameter Class identities. */
+    public static QuerySpec constructor(Class<?> owner, Class<?>... parameters) { return builder(owner, MemberKind.CONSTRUCTOR).parameters(parameters).build(); }
     public static Builder builder(String owner, MemberKind kind) { return new Builder(owner, null, kind); }
     public String owner() { return owner; }
     public String name() { return name; }
@@ -77,7 +85,12 @@ public final class QuerySpec {
     public Class<?> returnClass() { return returnClass; }
     public boolean portable() { return runtimeOwner == null && parameterClasses == null && argumentClasses == null && returnClass == null; }
     /** Descriptive value only, never a runtime cache key (Class identity is significant). */
-    public String summary() { return RULE_VERSION + ":" + kind + ":" + owner + ":" + name + ":" + selection + ":" + hierarchy + ":" + exact + ":" + staticOnly + ":" + bridge + ":" + synthetic + ":" + parameterCount + ":" + candidateBudget + ":" + resultLimit + ":" + depthLimit + ":" + compatibility + ":" + Arrays.toString(parameterClasses) + ":" + Arrays.toString(argumentClasses) + ":" + returnClass + ":" + providerId; }
+    public String summary() {
+        String value = summary;
+        if (value == null) summary = value = describe();
+        return value;
+    }
+    private String describe() { return RULE_VERSION + ":" + kind + ":" + owner + ":" + name + ":" + selection + ":" + hierarchy + ":" + exact + ":" + staticOnly + ":" + bridge + ":" + synthetic + ":" + parameterCount + ":" + candidateBudget + ":" + resultLimit + ":" + depthLimit + ":" + compatibility + ":" + Arrays.toString(parameterClasses) + ":" + Arrays.toString(argumentClasses) + ":" + returnClass + ":" + providerId; }
     @Override public boolean equals(Object other) {
         if (!(other instanceof QuerySpec)) return false;
         QuerySpec q = (QuerySpec) other;
@@ -103,8 +116,8 @@ public final class QuerySpec {
         private Boolean staticOnly, bridge, synthetic;
         private int parameterCount = -1, candidateBudget = 16384, resultLimit = 4096, depthLimit = 256;
         private Builder(String owner, Class<?> runtimeOwner, MemberKind kind) {
-            TypeDescriptor ownerType = TypeDescriptor.of("L" + Objects.requireNonNull(owner).replace('.', '/') + ";");
-            this.owner = ownerType.value().substring(1, ownerType.value().length() - 1).replace('/', '.');
+            TypeDescriptor.of("L" + Objects.requireNonNull(owner).replace('.', '/') + ";");
+            this.owner = owner.replace('/', '.'); // same result as the former substring/replace round trip
             this.runtimeOwner = runtimeOwner; this.kind = Objects.requireNonNull(kind);
         }
         private Builder exact(MemberDescriptor descriptor) { exact = descriptor; name = descriptor.name(); selection = Selection.EXACT; return this; }

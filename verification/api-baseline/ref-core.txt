@@ -105,6 +105,9 @@ public final class io.github.jichuo1.meguviz.ref.api.query.QuerySpec {
   public static final java.lang.String RULE_VERSION;
   public static io.github.jichuo1.meguviz.ref.api.query.QuerySpec exact(io.github.jichuo1.meguviz.ref.api.descriptor.MemberDescriptor);
   public static io.github.jichuo1.meguviz.ref.api.query.QuerySpec$Builder builder(java.lang.Class<?>, io.github.jichuo1.meguviz.ref.api.descriptor.MemberKind);
+  public static io.github.jichuo1.meguviz.ref.api.query.QuerySpec method(java.lang.Class<?>, java.lang.String, java.lang.Class<?>...);
+  public static io.github.jichuo1.meguviz.ref.api.query.QuerySpec field(java.lang.Class<?>, java.lang.String);
+  public static io.github.jichuo1.meguviz.ref.api.query.QuerySpec constructor(java.lang.Class<?>, java.lang.Class<?>...);
   public static io.github.jichuo1.meguviz.ref.api.query.QuerySpec$Builder builder(java.lang.String, io.github.jichuo1.meguviz.ref.api.descriptor.MemberKind);
   public java.lang.String owner();
   public java.lang.String name();
@@ -205,6 +208,7 @@ public final class io.github.jichuo1.meguviz.ref.runtime.invoke.ConstructorPlan 
   public io.github.jichuo1.meguviz.ref.runtime.invoke.ConstructorPlan(io.github.jichuo1.meguviz.ref.scope.CodeScope, io.github.jichuo1.meguviz.ref.api.result.ResolvedMember);
   public io.github.jichuo1.meguviz.ref.api.descriptor.MemberDescriptor descriptor();
   public java.lang.Object newInstance(java.lang.Object[]) throws java.lang.IllegalAccessException, java.lang.reflect.InvocationTargetException, java.lang.InstantiationException;
+  public java.lang.Object create(java.lang.Object...) throws java.lang.IllegalAccessException, java.lang.reflect.InvocationTargetException, java.lang.InstantiationException;
 }
 Compiled from "FieldPlan.java"
 public final class io.github.jichuo1.meguviz.ref.runtime.invoke.FieldPlan {
@@ -218,6 +222,7 @@ public final class io.github.jichuo1.meguviz.ref.runtime.invoke.MethodPlan {
   public io.github.jichuo1.meguviz.ref.runtime.invoke.MethodPlan(io.github.jichuo1.meguviz.ref.scope.CodeScope, io.github.jichuo1.meguviz.ref.api.result.ResolvedMember);
   public io.github.jichuo1.meguviz.ref.api.descriptor.MemberDescriptor descriptor();
   public java.lang.Object invoke(java.lang.Object, java.lang.Object[]) throws java.lang.IllegalAccessException, java.lang.reflect.InvocationTargetException;
+  public java.lang.Object call(java.lang.Object, java.lang.Object...) throws java.lang.IllegalAccessException, java.lang.reflect.InvocationTargetException;
 }
 Compiled from "StalePlanException.java"
 public final class io.github.jichuo1.meguviz.ref.runtime.invoke.StalePlanException extends java.lang.IllegalStateException {
@@ -266,18 +271,24 @@ public final class io.github.jichuo1.meguviz.ref.runtime.resolve.ReflectionResol
 Compiled from "CodeScope.java"
 public final class io.github.jichuo1.meguviz.ref.scope.CodeScope implements java.lang.AutoCloseable {
   public static io.github.jichuo1.meguviz.ref.scope.CodeScope open(java.lang.ClassLoader);
+  public static io.github.jichuo1.meguviz.ref.scope.CodeScope open(java.lang.ClassLoader, io.github.jichuo1.meguviz.ref.api.query.AccessPolicy);
   public static io.github.jichuo1.meguviz.ref.scope.CodeScope open(java.lang.ClassLoader, io.github.jichuo1.meguviz.ref.api.query.AccessPolicy, int);
   public io.github.jichuo1.meguviz.ref.api.query.AccessPolicy accessPolicy();
   public boolean usesLoader(java.lang.ClassLoader);
+  public boolean isCurrent(java.lang.ClassLoader, java.lang.String, long);
   public io.github.jichuo1.meguviz.ref.scope.CodeScope$State state();
   public long codeEpoch();
   public java.lang.String identity();
   public java.lang.String closeFailureType();
   public void installProviders(io.github.jichuo1.meguviz.ref.spi.ProviderRegistry, io.github.jichuo1.meguviz.ref.api.evidence.CodeIdentity);
   public io.github.jichuo1.meguviz.ref.api.result.ResolutionResult resolve(io.github.jichuo1.meguviz.ref.api.query.QuerySpec);
+  public io.github.jichuo1.meguviz.ref.scope.RawResolution resolveRaw(io.github.jichuo1.meguviz.ref.api.query.QuerySpec) throws java.lang.IllegalAccessException;
   public io.github.jichuo1.meguviz.ref.runtime.invoke.MethodPlan bindMethod(io.github.jichuo1.meguviz.ref.api.result.ResolvedMember) throws java.lang.IllegalAccessException;
   public io.github.jichuo1.meguviz.ref.runtime.invoke.FieldPlan bindField(io.github.jichuo1.meguviz.ref.api.result.ResolvedMember) throws java.lang.IllegalAccessException;
   public io.github.jichuo1.meguviz.ref.runtime.invoke.ConstructorPlan bindConstructor(io.github.jichuo1.meguviz.ref.api.result.ResolvedMember) throws java.lang.IllegalAccessException;
+  public io.github.jichuo1.meguviz.ref.runtime.invoke.MethodPlan bindMethod(io.github.jichuo1.meguviz.ref.api.query.QuerySpec) throws java.lang.IllegalAccessException;
+  public io.github.jichuo1.meguviz.ref.runtime.invoke.FieldPlan bindField(io.github.jichuo1.meguviz.ref.api.query.QuerySpec) throws java.lang.IllegalAccessException;
+  public io.github.jichuo1.meguviz.ref.runtime.invoke.ConstructorPlan bindConstructor(io.github.jichuo1.meguviz.ref.api.query.QuerySpec) throws java.lang.IllegalAccessException;
   public java.lang.reflect.Member exportRaw(io.github.jichuo1.meguviz.ref.api.result.ResolvedMember) throws java.lang.IllegalAccessException;
   public java.lang.Object invokeMethod(io.github.jichuo1.meguviz.ref.api.result.ResolvedMember, java.lang.Object, java.lang.Object[]) throws java.lang.IllegalAccessException, java.lang.reflect.InvocationTargetException;
   public java.lang.Object getField(io.github.jichuo1.meguviz.ref.api.result.ResolvedMember, java.lang.Object) throws java.lang.IllegalAccessException;
@@ -294,6 +305,12 @@ public final class io.github.jichuo1.meguviz.ref.scope.CodeScope$State extends j
   public static final io.github.jichuo1.meguviz.ref.scope.CodeScope$State CLOSED;
   public static io.github.jichuo1.meguviz.ref.scope.CodeScope$State[] values();
   public static io.github.jichuo1.meguviz.ref.scope.CodeScope$State valueOf(java.lang.String);
+}
+Compiled from "RawResolution.java"
+public final class io.github.jichuo1.meguviz.ref.scope.RawResolution {
+  public io.github.jichuo1.meguviz.ref.api.result.ResolutionStatus status();
+  public java.util.List<java.lang.reflect.Member> members();
+  public io.github.jichuo1.meguviz.ref.api.evidence.ResolutionReceipt receipt();
 }
 Compiled from "CandidateBatch.java"
 public final class io.github.jichuo1.meguviz.ref.spi.CandidateBatch {

@@ -11,4 +11,6 @@ public final class MethodPlan {
     public MethodPlan(CodeScope scope, ResolvedMember member) { this.scope = scope; this.member = member; }
     public MemberDescriptor descriptor() { return member.descriptor(); }
     public Object invoke(Object receiver, Object[] arguments) throws IllegalAccessException, InvocationTargetException { return scope.invokeMethod(member, receiver, arguments); }
+    /** Varargs form of {@link #invoke}, with Method.invoke's array convention; same conversion and exceptions. */
+    public Object call(Object receiver, Object... arguments) throws IllegalAccessException, InvocationTargetException { return scope.invokeMethod(member, receiver, arguments); }
 }

@@ -12,13 +12,20 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class ReflectionResolver {
     private final int schemaCapacity;
     private final Map<Member, MethodSchema> schemas = new LinkedHashMap<>(16, .75f, true);
+    /**
+     * Structural member tables by (Class identity, kind, public/declared), kept in first-enumeration order. LRU by
+     * table; the retained Member references (an empty table counts as one) never exceed the scope capacity, and a
+     * larger table is used once without being retained. Failed enumerations are never cached.
+     */
+    private final Map<TableKey, Member[]> tables = new LinkedHashMap<>(16, .75f, true);
+    private int tableMembers;
     private final AtomicLong parameterReads = new AtomicLong(), candidateChecks = new AtomicLong(), lookups = new AtomicLong();
     public ReflectionResolver(int schemaCapacity) { this.schemaCapacity = schemaCapacity; }
     public long parameterReads() { return parameterReads.get(); }
     public long candidateChecks() { return candidateChecks.get(); }
     public long lookups() { return lookups.get(); }
     public synchronized int schemaSize() { return schemas.size(); }
-    public synchronized void clear() { schemas.clear(); }
+    public synchronized void clear() { schemas.clear(); tables.clear(); tableMembers = 0; }
     private synchronized MethodSchema schema(Member member) {
         MethodSchema cached = schemas.get(member);
         if (cached != null) return cached;
@@ -80,8 +87,19 @@ public final class ReflectionResolver {
         } catch (NoSuchMethodException | NoSuchFieldException e) { return failure(ResolutionStatus.UNAVAILABLE, query, "not_found_or_filtered", e); }
     }
     private Outcome structural(QuerySpec query, Class<?> owner) {
+        int[] inspectedCount = new int[1];
+        try { return structural(query, owner, inspectedCount); }
+        finally { candidateChecks.addAndGet(inspectedCount[0]); }
+    }
+    /**
+     * The walked domain has no equal Members: one declared table per distinct class (Member equality includes the
+     * declaring class, and a class file cannot declare the same name and descriptor twice) or a single getMethods/
+     * getFields table, which the JDK and ART deduplicate. Only accepted matches keep a defensive set, created from the
+     * second match on, so the scope's one-slot-per-Member commit never sees duplicates.
+     */
+    private Outcome structural(QuerySpec query, Class<?> owner, int[] inspectedCount) {
         List<Entry> matches = new ArrayList<>();
-        Set<Member> visited = new HashSet<>();
+        Set<Member> accepted = null;
         int inspected = 0, depth = 0;
         boolean complete = true;
         String reason = "complete_visible_universe";
@@ -90,18 +108,21 @@ public final class ReflectionResolver {
         for (Class<?> current = owner; current != null; current = current.getSuperclass()) {
             if (++depth > query.depthLimit()) { complete = false; reason = "hierarchy_budget"; break; }
             Member[] members;
-            try { members = members(current, query); }
+            try { members = table(current, query); }
             catch (LinkageError e) { complete = false; reason = "signature_linkage_failure"; cause = e; break; }
             catch (SecurityException e) { complete = false; reason = "query_access_denied"; cause = e; break; }
             for (Member member : members) {
                 if (Thread.currentThread().isInterrupted()) return outcome(ResolutionStatus.CANCELLED, query, matches, false, inspected, "interrupted", null);
-                if (!visited.add(member)) continue;
                 if (inspected >= query.candidateBudget()) return select(query, matches, false, inspected, "candidate_budget", cause);
-                inspected++; candidateChecks.incrementAndGet();
+                inspectedCount[0] = ++inspected;
                 try {
                     if (!cheapMatches(member, query)) continue;
                     MethodSchema schema = schema(member);
                     if (!matches(schema, query, parameters, arguments)) continue;
+                    if (!matches.isEmpty()) {
+                        if (accepted == null) { accepted = new HashSet<>(); for (Entry match : matches) accepted.add(match.member); }
+                        if (!accepted.add(member)) continue;
+                    }
                     matches.add(new Entry(member, schema.descriptor()));
                 } catch (LinkageError e) { complete = false; reason = "candidate_signature_unknown"; cause = e; continue; }
                 if (query.selection() == Selection.FIRST) return select(query, matches, false, inspected, complete ? "first_in_reflection_order" : reason, cause);
@@ -116,6 +137,27 @@ public final class ReflectionResolver {
         if (Thread.currentThread().isInterrupted()) return outcome(ResolutionStatus.CANCELLED, query, matches, false, inspected, "interrupted", null);
         return select(query, matches, complete, inspected, reason, cause);
     }
+    /** Cached structural enumeration; the arrays are never mutated or handed to callers. */
+    private Member[] table(Class<?> owner, QuerySpec query) {
+        TableKey key = new TableKey(owner, query.kind(), query.kind() != MemberKind.CONSTRUCTOR && query.hierarchy() == Hierarchy.JAVA_PUBLIC);
+        synchronized (this) {
+            Member[] cached = tables.get(key);
+            if (cached != null) return cached;
+        }
+        Member[] fresh = members(owner, query);
+        int cost = Math.max(1, fresh.length);
+        if (cost > schemaCapacity) return fresh;
+        synchronized (this) {
+            Member[] raced = tables.get(key);
+            if (raced != null) return raced;
+            tables.put(key, fresh); tableMembers += cost;
+            for (Iterator<Member[]> eldest = tables.values().iterator(); tableMembers > schemaCapacity; ) {
+                tableMembers -= Math.max(1, eldest.next().length); eldest.remove();
+            }
+            return fresh;
+        }
+    }
+    /** Direct enumeration: a fresh copy on every call (provider domains and the verifier keep using it). */
     private Member[] members(Class<?> owner, QuerySpec query) {
         boolean publicLookup = query.hierarchy() == Hierarchy.JAVA_PUBLIC;
         switch (query.kind()) {
@@ -142,6 +184,11 @@ public final class ReflectionResolver {
         return query.returnClass() == null || query.returnClass() == schema.type();
     }
     private Outcome provider(QuerySpec query, Class<?> owner, ClassLoader loader, ProviderRegistry registry, String fingerprint) {
+        int[] inspectedCount = new int[1];
+        try { return provider(query, owner, loader, registry, fingerprint, inspectedCount); }
+        finally { candidateChecks.addAndGet(inspectedCount[0]); }
+    }
+    private Outcome provider(QuerySpec query, Class<?> owner, ClassLoader loader, ProviderRegistry registry, String fingerprint, int[] inspectedCount) {
         if (registry == null || fingerprint == null) return failure(ResolutionStatus.UNAVAILABLE, query, "provider_or_code_identity_missing", null);
         CandidateProvider provider = registry.provider(query.providerId());
         if (provider == null) return failure(ResolutionStatus.UNAVAILABLE, query, "provider_not_installed", null);
@@ -161,7 +208,7 @@ public final class ReflectionResolver {
         for (MemberDescriptor descriptor : batch.candidates()) {
             if (Thread.currentThread().isInterrupted()) return outcome(ResolutionStatus.CANCELLED, query, matches, false, inspected, "interrupted", null);
             if (inspected >= query.candidateBudget()) { complete = false; reason = "candidate_budget"; break; }
-            inspected++; candidateChecks.incrementAndGet();
+            inspectedCount[0] = ++inspected;
             Outcome verified = resolve(QuerySpec.exact(descriptor), loader, null, null);
             Entry entry = verified.status == ResolutionStatus.RESOLVED ? verified.entries.get(0) : null;
             boolean inDomain = entry != null && inDomain(owner, entry.member.getDeclaringClass(), query)
@@ -199,7 +246,7 @@ public final class ReflectionResolver {
         ProviderDescriptor providerDescriptor = provider.descriptor();
         if (Thread.currentThread().isInterrupted()) return outcome(ResolutionStatus.CANCELLED, query, matches, false, inspected, "interrupted", null);
         Outcome result = select(query, matches, complete, inspected, reason, cause);
-        return new Outcome(result.status, result.entries, new Coverage("provider:" + providerDescriptor.id() + ":" + batch.universe(), result.coverage.complete(), inspected, reason), reason, result.cause);
+        return Outcome.trusted(result.status, result.entries, new Coverage("provider:" + providerDescriptor.id() + ":" + batch.universe(), result.coverage.complete(), inspected, reason), reason, result.cause);
     }
     /** Resolve a shadowed declaring owner only within the actual requested domain. */
     private Entry domainEntry(QuerySpec query, Class<?> owner, ClassLoader loader, MemberDescriptor descriptor,
@@ -259,7 +306,14 @@ public final class ReflectionResolver {
     }
     private static Outcome failure(ResolutionStatus status, QuerySpec query, String reason, Throwable cause) { return outcome(status, query, Collections.emptyList(), false, 0, reason, cause); }
     private static Outcome outcome(ResolutionStatus status, QuerySpec query, List<Entry> matches, boolean complete, int inspected, String reason, Throwable cause) {
-        return new Outcome(status, matches, new Coverage("java-visible:" + query.owner() + ":" + query.hierarchy(), complete, inspected, reason), reason, cause == null ? null : cause.getClass().getName());
+        return Outcome.trusted(status, matches, new Coverage("java-visible:" + query.owner() + ":" + query.hierarchy(), complete, inspected, reason), reason, cause == null ? null : cause.getClass().getName());
+    }
+    private static final class TableKey {
+        final Class<?> owner;
+        final int shape;
+        TableKey(Class<?> owner, MemberKind kind, boolean publicLookup) { this.owner = owner; this.shape = kind.ordinal() * 2 + (publicLookup ? 1 : 0); }
+        @Override public boolean equals(Object other) { return other instanceof TableKey && ((TableKey) other).owner == owner && ((TableKey) other).shape == shape; }
+        @Override public int hashCode() { return owner.hashCode() * 31 + shape; }
     }
     public static final class Entry {
         public final Member member;
@@ -272,7 +326,14 @@ public final class ReflectionResolver {
         public final Coverage coverage;
         public final String reason, cause;
         public Outcome(ResolutionStatus status, List<Entry> entries, Coverage coverage, String reason, String cause) {
-            this.status = status; this.entries = Collections.unmodifiableList(new ArrayList<>(entries)); this.coverage = coverage; this.reason = reason; this.cause = cause;
+            this(status, Collections.unmodifiableList(new ArrayList<>(entries)), coverage, reason, cause, true);
+        }
+        private Outcome(ResolutionStatus status, List<Entry> entries, Coverage coverage, String reason, String cause, boolean owned) {
+            this.status = status; this.entries = entries; this.coverage = coverage; this.reason = reason; this.cause = cause;
+        }
+        /** Internal lists are never mutated after an outcome is built, so they are wrapped instead of copied. */
+        private static Outcome trusted(ResolutionStatus status, List<Entry> entries, Coverage coverage, String reason, String cause) {
+            return new Outcome(status, Collections.unmodifiableList(entries), coverage, reason, cause, true);
         }
         static Outcome single(Member member, MemberDescriptor descriptor, QuerySpec query, int inspected) {
             return outcome(ResolutionStatus.RESOLVED, query, Collections.singletonList(new Entry(member, descriptor)), true, inspected, "exact_runtime_verified", null);

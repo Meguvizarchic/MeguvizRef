@@ -11,4 +11,6 @@ public final class ConstructorPlan {
     public ConstructorPlan(CodeScope scope, ResolvedMember member) { this.scope = scope; this.member = member; }
     public MemberDescriptor descriptor() { return member.descriptor(); }
     public Object newInstance(Object[] arguments) throws IllegalAccessException, InvocationTargetException, InstantiationException { return scope.construct(member, arguments); }
+    /** Varargs form of {@link #newInstance}, with Constructor.newInstance's array convention. */
+    public Object create(Object... arguments) throws IllegalAccessException, InvocationTargetException, InstantiationException { return scope.construct(member, arguments); }
 }

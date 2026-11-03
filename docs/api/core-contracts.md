@@ -4,6 +4,8 @@
 
 `TypeDescriptor.of` 校验 JVM 类型语法、void 位置、255 维数组和大小预算。`MemberDescriptor` 保存真实声明 owner、成员种类、名称、完整参数及返回/字段类型。`QuerySpec.exact` 为 portable 完整描述；`QuerySpec.builder(Class, kind)` 及 Class/实参便捷入口是 runtime-only，缓存按 Class 对象身份隔离，不将相同类名跨 loader 合并。实参入口只保存参数的 Class 或 null，不保留 receiver/对象值。
 
+`QuerySpec.method(owner, name, parameters...)`、`QuerySpec.field(owner, name)` 和 `QuerySpec.constructor(owner, parameters...)`（1.1.0 起）分别等价于 `builder(owner, kind)` 加 `name`/`parameters` 后 `build()`：默认 `UNIQUE`、`DECLARED`，参数按 `Class` 身份精确匹配，不附加 bridge/synthetic 等其他过滤。
+
 构建完成的 `QuerySpec` 不可变，可以显式复用和跨线程传递；它是查询条件，不是 scope token，也不固定解析结果。`CodeScope` 的缓存、binding 和 epoch 相互独立：推进 epoch 后必须重新解析并取得新 token，关闭后需使用新 scope；Provider 查询还需满足新作用域的代码身份要求。显式复用不替代调用方自己的 loader、epoch 或目标条件校验。
 
 携带 `runtimeOwner`、参数/返回 `Class` 或实参类型的查询会强持有这些类；调用方长期保存查询时也可能延长其定义加载器的生命周期，scope 关闭不会清除调用方持有的查询。`QuerySpec.builder(Class, ...)` 使用传入的 Class，即使作用域配置了另一个 loader；`scope.usesLoader(loader)` 只核对作用域自身的 loader，不证明查询的 Class 由该 loader 选择。调用方可将通过预期 loader 实际加载得到的 owner 与查询的 `runtimeOwner()` 按引用比较；使用 `getClassLoader() == loader` 会错误排除正常的父加载器委派。对更新后的代码或其他 loader，应重新确认条件并在必要时重建查询。
@@ -18,19 +20,27 @@ Provider 查询的完整覆盖需独立重放可见域；`FIRST` 在覆盖得到
 
 `CompatibilityPolicy.LEGACY_BIL` 使用严格装箱匹配，null 只接受引用类型；`JAVA_INVOCATION` 允许反射的 primitive widening，禁止 narrowing/boolean 混用。不实现 Java 编译器重载决议，不隐式打包 varargs。
 
-结构筛选按 name/static/arity/flags 先短路，再建立一次参数快照。私有数组不会经 getter 外泄。精确查询不创建全类 schema；schema 缓存有界。query cache 只缓存完整且稳定的成功，默认没有负缓存。`parameterReads` 计数的是成功创建的方法或构造器 schema，不包括创建失败时已发生的读取、独立覆盖验证或精确路径的直接反射读取，也不包含 VM 枚举内部分配；它不是全部元数据读取次数或时间收益。
+结构筛选按 name/static/arity/flags 先短路，再建立一次参数快照。私有数组不会经 getter 外泄。精确查询不创建全类 schema；schema 缓存有界。query cache 只缓存完整且稳定的成功，默认没有负缓存；命中最近使用的一项时不加锁返回，LRU 顺序与 `cacheHits` 计数不变。
 
-默认容量 4096，同时约束 query/schema 缓存和 live binding 数。query/schema 按 LRU 淘汰，已经发布的 binding 不自动驱逐；新成员超出 live binding 容量返回 `PARTIAL/binding_capacity`，既有计划仍有效。长期作用域调用方需选择合适容量或显式换作用域，不能把无界成员集合放入本库。
+结构查询在作用域内按 (Class 身份, 成员种类, public/declared) 复用首次枚举得到的成员表，保持该次枚举的顺序，`FIRST` 与 `inspected` 不变。枚举失败（链接错误、安全拒绝）不缓存。成员表随 `advanceCodeEpoch` 和 `close` 清空；首次枚举之后才生效的 Android 隐藏 API 豁免或类结构变化不会反映到已缓存的表，应推进 epoch 或换作用域。Provider 候选域和覆盖复核仍直接枚举。遍历域内的 Member 互不相等（不同类各自的声明表，或单次 `getMethods`/`getFields`），结果仍按 Member 去重。`parameterReads` 计数的是成功创建的方法或构造器 schema，不包括创建失败时已发生的读取、独立覆盖验证或精确路径的直接反射读取，也不包含 VM 枚举内部分配；它不是全部元数据读取次数或时间收益。
+
+默认容量 4096，同时约束 query/schema 缓存、成员表缓存保留的 Member 引用总数（空表计 1，单表超过容量时只用一次、不保留）和 live binding 数。query/schema/成员表按 LRU 淘汰，已经发布的 binding 不自动驱逐；新成员超出 live binding 容量返回 `PARTIAL/binding_capacity`，既有计划仍有效。长期作用域调用方需选择合适容量或显式换作用域，不能把无界成员集合放入本库。
 
 已取消查询若部分匹配需要的新 binding 超出容量，保留 `CANCELLED` 和原中断原因，不创建 binding 或返回成员；容量充足时仍保留已有的部分成员行为。取消回执的 coverage 始终不完整，不能作为完整查询结果。
 
-作用域 access policy 固定，默认不更改 accessible。显式 `TRY_SUPPRESS_JAVA_CHECKS` 只使用公共 `setAccessible`；实际拒绝以 IllegalAccessException 保留 cause，不承诺绕过 Java 模块或 Android hidden API。
+作用域 access policy 固定，默认不更改 accessible；`CodeScope.open(loader, policy)`（1.1.0 起）使用默认容量 4096。显式 `TRY_SUPPRESS_JAVA_CHECKS` 只使用公共 `setAccessible`；实际拒绝以 IllegalAccessException 保留 cause，不承诺绕过 Java 模块或 Android hidden API。
 
-MethodPlan、FieldPlan、ConstructorPlan 分离，无 receiver 字段。调用保留反射 conversion、virtual dispatch、初始化、InvocationTargetException；目标进入后不切候选或重试。计划只持 CodeScope 和描述 token，Member 存于 scope slot。原始 `exportRaw` 是显式所有权外逸，调用方可缓存或交给 Hook，关闭不会撤销已导出 Member。
+MethodPlan、FieldPlan、ConstructorPlan 分离，无 receiver 字段。调用保留反射 conversion、virtual dispatch、初始化、InvocationTargetException；目标进入后不切候选或重试。计划只持 CodeScope 和描述 token，Member 存于 scope slot。`MethodPlan.call(receiver, args...)` 和 `ConstructorPlan.create(args...)`（1.1.0 起）是 `invoke`/`newInstance` 的可变参数形式，数组约定与 `Method.invoke` 相同（单个 `Object[]` 实参即参数数组），转换和异常完全一致；原有方法签名与 Kotlin 源码含义不变。`bindMethod/bindField/bindConstructor(QuerySpec)` 等价于对 `resolve(query).requireSingle()` 绑定，非唯一结果抛 `ResolutionException`。
 
-`close`: OPEN→RETIRING→CLOSED。同步线性化点拒绝新调用并清理缓存、槽位及 loader；已进入的方法持自己的局部 Member，可完成后释放。close 不等待在途工作排空，但没有在途工作时会同步执行 Provider 关闭，因而耗时取决于 Provider。重复 close 幂等。Provider 在全部在途解析/调用排空后关闭；排空时的非 `Error` Provider close 失败记录 `closeFailureType()`，不盖住目标异常，并继续关闭其余 Provider。`Error` 仍会传播，可能覆盖在途异常；不保证其余 Provider 继续关闭。没有在途工作时显式 close 的关闭失败原样抛出。清理过程中保留已观察到的线程中断标志，即使 provider 清除了它；未声明的 `InterruptedException` 同样保留原对象并恢复标志。
+计划调用不进入作用域监视器：先用当前绑定快照校验令牌的 identity、epoch、槽位和描述符，再在作用域尚未开始关闭时原子计入在途数。`advanceCodeEpoch` 之前已取得旧快照的调用仍可完成，等同于发生在 epoch 推进之前；之后开始的调用得到 `StalePlanException`。`identity()` 是进程内唯一的 UUID 格式文本（每次类加载一个随机前缀加递增序号），不保证不可预测；令牌不是安全凭证。
+
+原始 `exportRaw` 是显式所有权外逸，调用方可缓存或交给 Hook，关闭不会撤销已导出 Member。`resolveRaw(query)`（1.1.0 起）是批量形式：状态、原因、覆盖和描述符与 `resolve` 相同，但直接返回原始 Member，不创建 binding、不写入查询缓存，因此不会出现 `binding_capacity`；已缓存的令牌结果会被复用。返回前按作用域访问策略逐个准备访问，`TRY_SUPPRESS_JAVA_CHECKS` 下第一个被拒绝的成员抛出 `IllegalAccessException`。它与 `resolve` 使用不同的 single-flight 键，同样计入在途排空；只有 `CodeScope` 能创建 `RawResolution`。
+
+`close`: OPEN→RETIRING→CLOSED。同步线性化点（锁内一次原子置位关闭标志）拒绝新调用并清理缓存、槽位及 loader；在它之前准入的解析和调用计入排空，之后的调用直接被拒绝，不计数，被拒绝的调用方也不会执行 Provider 关闭；已进入的方法持自己的局部 Member，可完成后释放。close 不等待在途工作排空，但没有在途工作时会同步执行 Provider 关闭，因而耗时取决于 Provider。重复 close 幂等。Provider 在全部在途解析/调用排空后关闭；排空时的非 `Error` Provider close 失败记录 `closeFailureType()`，不盖住目标异常，并继续关闭其余 Provider。`Error` 仍会传播，可能覆盖在途异常；不保证其余 Provider 继续关闭。没有在途工作时显式 close 的关闭失败原样抛出。清理过程中保留已观察到的线程中断标志，即使 provider 清除了它；未声明的 `InterruptedException` 同样保留原对象并恢复标志。
 
 `CLOSED` 表示作用域不再接受工作，可能在锁外的 Provider 关闭完成前就被观察到；`closeFailureType()` 暂时为空也不证明清理已经完成。需要知道清理是否结束的调用方应自行协调在途工作，并等待实际执行同步关闭或最后一次释放的操作完成；单独等待已提前返回的 `close()` 不足以证明排空后的清理完成。
+
+`isCurrent(loader, identity, epoch)`（1.1.0 起）在一次加锁内求值 `usesLoader(loader) && identity().equals(identity) && codeEpoch() == epoch`，null identity 不匹配；它只核对作用域自身，不替代调用方对查询 Class 与外部 epoch 的检查。
 
 `advanceCodeEpoch(reason)` 清除本进程绑定/缓存并使旧 token 失效；Long.MAX_VALUE 换新 scope identity，再从 0 计数。code epoch 变更同时使当前强代码指纹失效，Provider 需要携带新内容身份的新 scope。作用域不管理 UI 生命周期。
 
