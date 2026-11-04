@@ -17,12 +17,12 @@ public final class QueryCoordinator<K, V> {
     }
     /** The handler runs only when this caller's wait is interrupted, never for owner work. */
     public V execute(K key, Supplier<V> work, long timeoutMillis, Function<InterruptedException, V> waiterInterrupted) throws InterruptedException, TimeoutException {
-        Flight<V> flight; boolean owner;
+        Flight<V> flight; CompletableFuture<V> future = null;
         Thread current = Thread.currentThread();
         synchronized (this) {
             if (closed) throw new CancellationException("scope closed");
-            flight = flights.get(key); owner = flight == null;
-            if (owner) {
+            flight = flights.get(key);
+            if (flight == null) {
                 if (flights.size() >= capacity) throw new RejectedExecutionException("single-flight capacity");
                 flight = new Flight<>(current); flights.put(key, flight);
             } else {
@@ -33,14 +33,20 @@ public final class QueryCoordinator<K, V> {
                     dependency = waits.get(dependency);
                 }
                 waits.put(current, flight.owner);
+                // The first waiter creates the future; a flight nobody waits for never allocates one.
+                if (flight.future == null) flight.future = new CompletableFuture<>();
+                future = flight.future;
             }
         }
-        if (owner) {
-            try { V result = work.get(); flight.future.complete(result); return result; }
-            catch (Throwable failure) { flight.future.completeExceptionally(failure); throw failure; }
-            finally { synchronized (this) { if (flights.get(key) == flight) flights.remove(key); } }
+        if (future == null) {
+            V result;
+            try { result = work.get(); }
+            catch (Throwable failure) { CompletableFuture<V> waiting = finish(key, flight); if (waiting != null) waiting.completeExceptionally(failure); throw failure; }
+            CompletableFuture<V> waiting = finish(key, flight);
+            if (waiting != null) waiting.complete(result);
+            return result;
         }
-        try { return flight.future.get(timeoutMillis, TimeUnit.MILLISECONDS); }
+        try { return future.get(timeoutMillis, TimeUnit.MILLISECONDS); }
         catch (InterruptedException interrupted) {
             if (waiterInterrupted == null) throw interrupted;
             return waiterInterrupted.apply(interrupted);
@@ -52,14 +58,25 @@ public final class QueryCoordinator<K, V> {
             throw new IllegalStateException(cause);
         } finally { synchronized (this) { waits.remove(current); } }
     }
+    /**
+     * Owner completion: removing the flight and reading its future under the monitor means every waiter that attached
+     * gets this outcome, and a later caller starts a new flight.
+     */
+    private CompletableFuture<V> finish(K key, Flight<V> flight) {
+        synchronized (this) {
+            if (flights.get(key) == flight) flights.remove(key);
+            return flight.future;
+        }
+    }
     public synchronized void close() {
         closed = true;
-        for (Flight<V> flight : flights.values()) flight.future.completeExceptionally(new CancellationException("scope closed"));
+        for (Flight<V> flight : flights.values()) if (flight.future != null) flight.future.completeExceptionally(new CancellationException("scope closed"));
         flights.clear(); waits.clear();
     }
     private static final class Flight<V> {
         final Thread owner;
-        final CompletableFuture<V> future = new CompletableFuture<>();
+        /** Guarded by the coordinator monitor; created by the first waiter. */
+        CompletableFuture<V> future;
         Flight(Thread owner) { this.owner = owner; }
     }
 }

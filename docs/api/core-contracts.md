@@ -10,7 +10,7 @@
 
 携带 `runtimeOwner`、参数/返回 `Class` 或实参类型的查询会强持有这些类；调用方长期保存查询时也可能延长其定义加载器的生命周期，scope 关闭不会清除调用方持有的查询。`QuerySpec.builder(Class, ...)` 使用传入的 Class，即使作用域配置了另一个 loader；`scope.usesLoader(loader)` 只核对作用域自身的 loader，不证明查询的 Class 由该 loader 选择。调用方可将通过预期 loader 实际加载得到的 owner 与查询的 `runtimeOwner()` 按引用比较；使用 `getClassLoader() == loader` 会错误排除正常的父加载器委派。对更新后的代码或其他 loader，应重新确认条件并在必要时重建查询。
 
-精确描述符先走公开精确反射入口。owner 经作用域 loader 加载后，参数及返回/字段类型优先使用该 owner 的定义加载器解析；这与实际声明的类型身份一致，避免子加载器遮蔽同名类型造成误判。若读取定义加载器或使用它解析类型被安全管理器拒绝，则回退到原有作用域 loader 路径，并继续用反射实际 `Class` 身份校验；权限受限且类型被遮蔽时仍可能保守失败。协变返回/bridge 的返回类型不符时，在预算内回退到声明域验证完整签名。类加载使用 `Class.forName(name, false, loader)`，查询不会主动初始化。不存在与系统过滤统一为 `UNAVAILABLE/not_found_or_filtered`，不会构造物理不存在证明。
+精确描述符先走公开精确反射入口。owner 经作用域 loader 加载后，参数及返回/字段类型优先使用该 owner 的定义加载器解析；这与实际声明的类型身份一致，避免子加载器遮蔽同名类型造成误判。若读取定义加载器或使用它解析类型被安全管理器拒绝，则回退到原有作用域 loader 路径，并继续用反射实际 `Class` 身份校验；权限受限且类型被遮蔽时仍可能保守失败。协变返回/bridge 的返回类型不符时，在预算内回退到声明域验证完整签名。类加载使用 `Class.forName(name, false, loader)`，查询不会主动初始化。同一作用域（同一 epoch）内从第二次查找起，owner 与参数/返回/字段类型的成功加载结果按（发起加载器身份，名字）缓存（1.1.0 起）：命中与对同一加载器重复调用 `Class.forName` 得到同一个 `Class`，一个加载器不会得到经另一个加载器查到的类；失败不缓存，条目数不超过作用域容量，随 `advanceCodeEpoch` 和 `close` 丢弃。缓存命中时不再重复 `Class.forName` 内部的安全管理器检查，同一（加载器，名字）的权限决定只在首次查找时评估；`getClassLoader()` 的检查与上述回退不变。不存在与系统过滤统一为 `UNAVAILABLE/not_found_or_filtered`，不会构造物理不存在证明。
 
 `DECLARED` 只遍历声明类；`SUPERCLASSES` 按当前类、父类直到 Object 逐级处理；`JAVA_PUBLIC` 使用 Java 公共成员查询语义。构造器不继承，不提供自定义 interface DAG 查询。
 
@@ -32,11 +32,11 @@ Provider 查询的完整覆盖需独立重放可见域；`FIRST` 在覆盖得到
 
 MethodPlan、FieldPlan、ConstructorPlan 分离，无 receiver 字段。调用保留反射 conversion、virtual dispatch、初始化、InvocationTargetException；目标进入后不切候选或重试。计划只持 CodeScope 和描述 token，Member 存于 scope slot。`MethodPlan.call(receiver, args...)` 和 `ConstructorPlan.create(args...)`（1.1.0 起）是 `invoke`/`newInstance` 的可变参数形式，数组约定与 `Method.invoke` 相同（单个 `Object[]` 实参即参数数组），转换和异常完全一致；原有方法签名与 Kotlin 源码含义不变。`bindMethod/bindField/bindConstructor(QuerySpec)` 等价于对 `resolve(query).requireSingle()` 绑定，非唯一结果抛 `ResolutionException`。
 
-计划调用不进入作用域监视器：先用当前绑定快照校验令牌的 identity、epoch、槽位和描述符，再在作用域尚未开始关闭时原子计入在途数。`advanceCodeEpoch` 之前已取得旧快照的调用仍可完成，等同于发生在 epoch 推进之前；之后开始的调用得到 `StalePlanException`。`identity()` 是进程内唯一的 UUID 格式文本（每次类加载一个随机前缀加递增序号），不保证不可预测；令牌不是安全凭证。
+计划调用不进入作用域监视器：先用当前绑定快照校验令牌的 identity、epoch、槽位和描述符，再在作用域尚未开始关闭时原子计入在途数。在途数平时只有一个计数字；某次调用在它上面的 CAS 连续失败（观察到竞争）后，作用域在锁内创建一次按线程号分配、彼此相隔 128 字节的计数单元（1.1.0 起，每个作用域最多一次，之后的调用不加锁），此后的计划调用在本线程的单元计数，解析仍计入计数字。close 先关闭计数字再关闭各单元，单元上的调用先确认计数字尚未关闭，因此在任一调用被拒绝之后才开始的调用都会被拒绝。`advanceCodeEpoch` 之前已取得旧快照的调用仍可完成，等同于发生在 epoch 推进之前；之后开始的调用得到 `StalePlanException`。`diagnostics()` 的 `inFlight` 是计数字与各单元之和：没有调用开始或结束时是精确值，并发变化中读到的和与 `LongAdder.sum()` 一样不一定对应某一时刻。`identity()` 是进程内唯一的 UUID 格式文本（每次类加载一个随机前缀加递增序号），不保证不可预测；令牌不是安全凭证。
 
 原始 `exportRaw` 是显式所有权外逸，调用方可缓存或交给 Hook，关闭不会撤销已导出 Member。`resolveRaw(query)`（1.1.0 起）是批量形式：状态、原因、覆盖和描述符与 `resolve` 相同，但直接返回原始 Member，不创建 binding、不写入查询缓存，因此不会出现 `binding_capacity`；已缓存的令牌结果会被复用。返回前按作用域访问策略逐个准备访问，`TRY_SUPPRESS_JAVA_CHECKS` 下第一个被拒绝的成员抛出 `IllegalAccessException`。它与 `resolve` 使用不同的 single-flight 键，同样计入在途排空；只有 `CodeScope` 能创建 `RawResolution`。
 
-`close`: OPEN→RETIRING→CLOSED。同步线性化点（锁内一次原子置位关闭标志）拒绝新调用并清理缓存、槽位及 loader；在它之前准入的解析和调用计入排空，之后的调用直接被拒绝，不计数，被拒绝的调用方也不会执行 Provider 关闭；已进入的方法持自己的局部 Member，可完成后释放。close 不等待在途工作排空，但没有在途工作时会同步执行 Provider 关闭，因而耗时取决于 Provider。重复 close 幂等。Provider 在全部在途解析/调用排空后关闭；排空时的非 `Error` Provider close 失败记录 `closeFailureType()`，不盖住目标异常，并继续关闭其余 Provider。`Error` 仍会传播，可能覆盖在途异常；不保证其余 Provider 继续关闭。没有在途工作时显式 close 的关闭失败原样抛出。清理过程中保留已观察到的线程中断标志，即使 provider 清除了它；未声明的 `InterruptedException` 同样保留原对象并恢复标志。
+`close`: OPEN→RETIRING→CLOSED。同步线性化点（锁内原子置位关闭标志：没有计数单元时是一次置位，有单元时先置位计数字、再逐个置位单元）拒绝新调用并清理缓存、槽位及 loader；在它之前准入的解析和调用计入排空，之后的调用直接被拒绝，不计数，被拒绝的调用方也不会执行 Provider 关闭；已进入的方法持自己的局部 Member，可完成后释放。close 不等待在途工作排空，但没有在途工作时会同步执行 Provider 关闭，因而耗时取决于 Provider。有计数单元时，每个仍有在途工作的计数由其最后一个释放者交还一份排空份额，close 自己持一份，取得最后一份者关闭 Provider：若这些工作在 close 的锁内阶段已全部结束，由 close 同步关闭（失败照常从 close 抛出），否则由最后释放的在途调用关闭。重复 close 幂等。Provider 在全部在途解析/调用排空后关闭；排空时的非 `Error` Provider close 失败记录 `closeFailureType()`，不盖住目标异常，并继续关闭其余 Provider。`Error` 仍会传播，可能覆盖在途异常；不保证其余 Provider 继续关闭。没有在途工作时显式 close 的关闭失败原样抛出。清理过程中保留已观察到的线程中断标志，即使 provider 清除了它；未声明的 `InterruptedException` 同样保留原对象并恢复标志。
 
 `CLOSED` 表示作用域不再接受工作，可能在锁外的 Provider 关闭完成前就被观察到；`closeFailureType()` 暂时为空也不证明清理已经完成。需要知道清理是否结束的调用方应自行协调在途工作，并等待实际执行同步关闭或最后一次释放的操作完成；单独等待已提前返回的 `close()` 不足以证明排空后的清理完成。
 

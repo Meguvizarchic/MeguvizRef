@@ -19,13 +19,67 @@ public final class ReflectionResolver {
      */
     private final Map<TableKey, Member[]> tables = new LinkedHashMap<>(16, .75f, true);
     private int tableMembers;
+    /**
+     * The most recently used retained table (the LRU tail), set under this monitor by every table lookup or insert and
+     * cleared with the tables. Serving it without touching the map leaves the eviction order unchanged, so a batch of
+     * queries on one owner reuses the table without a key allocation or map lookup.
+     */
+    private volatile LastTable lastTable;
+    /**
+     * Positive cache of {@code Class.forName(name, false, loader)} for owner names and exact-descriptor types, keyed by
+     * the initiating loader's identity and then the name (owner binary names and descriptor strings never collide:
+     * owners cannot contain ';' or '['). HotSpot records a successful lookup in that loader's dictionary and ART in its
+     * class table, so a later call with the same loader returns the same Class; a hit therefore equals a repeated
+     * call, and one loader can never receive a Class looked up through another. Failures are never cached. Used from
+     * the resolver's second lookup on, so a scope that resolves once allocates nothing for it. At most
+     * {@code schemaCapacity} entries; dropped with the resolver (epoch, close).
+     */
+    private IdentityHashMap<ClassLoader, Map<String, Class<?>>> loaded;
+    private int loadedTypes;
+    /** Last coverage universe built by any resolver; immutable, so a racy read sees a complete value or another one. */
+    private static Universe lastUniverse;
     private final AtomicLong parameterReads = new AtomicLong(), candidateChecks = new AtomicLong(), lookups = new AtomicLong();
     public ReflectionResolver(int schemaCapacity) { this.schemaCapacity = schemaCapacity; }
     public long parameterReads() { return parameterReads.get(); }
     public long candidateChecks() { return candidateChecks.get(); }
     public long lookups() { return lookups.get(); }
     public synchronized int schemaSize() { return schemas.size(); }
-    public synchronized void clear() { schemas.clear(); tables.clear(); tableMembers = 0; }
+    public synchronized void clear() { schemas.clear(); tables.clear(); tableMembers = 0; lastTable = null; loaded = null; loadedTypes = 0; }
+    private synchronized Class<?> loadedType(ClassLoader loader, String name) {
+        Map<String, Class<?>> names = loaded == null ? null : loaded.get(loader);
+        return names == null ? null : names.get(name);
+    }
+    private synchronized void rememberType(ClassLoader loader, String name, Class<?> type) {
+        if (loadedTypes >= schemaCapacity) return;
+        if (loaded == null) loaded = new IdentityHashMap<>();
+        Map<String, Class<?>> names = loaded.get(loader);
+        if (names == null) loaded.put(loader, names = new HashMap<>());
+        if (names.putIfAbsent(name, type) == null) loadedTypes++;
+    }
+    /** {@code Class.forName(name, false, loader)} through the per-scope cache. */
+    private Class<?> loadOwner(String name, ClassLoader loader) throws ClassNotFoundException {
+        if (lookups.get() < 2) return Class.forName(name, false, loader);
+        Class<?> type = loadedType(loader, name);
+        if (type == null) { type = Class.forName(name, false, loader); rememberType(loader, name, type); }
+        return type;
+    }
+    /** Fills the parameter types and returns the return/field type, through the cache when {@code reuse}. */
+    private Class<?> resolveTypes(MemberDescriptor d, ClassLoader loader, Class<?>[] parameters, boolean reuse) throws ClassNotFoundException {
+        if (!reuse) {
+            for (int i = 0; i < parameters.length; i++) parameters[i] = d.parameters().get(i).resolve(loader);
+            return d.type().resolve(loader);
+        }
+        for (int i = 0; i < parameters.length; i++) parameters[i] = resolveType(d.parameters().get(i), loader);
+        return resolveType(d.type(), loader);
+    }
+    /** {@code descriptor.resolve(loader)} through the per-scope cache; primitives never reach the cache. */
+    private Class<?> resolveType(TypeDescriptor descriptor, ClassLoader loader) throws ClassNotFoundException {
+        String value = descriptor.value();
+        if (value.length() == 1) return descriptor.resolve(loader);
+        Class<?> type = loadedType(loader, value);
+        if (type == null) { type = descriptor.resolve(loader); rememberType(loader, value, type); }
+        return type;
+    }
     private synchronized MethodSchema schema(Member member) {
         MethodSchema cached = schemas.get(member);
         if (cached != null) return cached;
@@ -41,7 +95,7 @@ public final class ReflectionResolver {
         lookups.incrementAndGet();
         if (Thread.currentThread().isInterrupted()) return failure(ResolutionStatus.CANCELLED, query, "interrupted", null);
         try {
-            Class<?> owner = query.runtimeOwner() == null ? Class.forName(query.owner(), false, loader) : query.runtimeOwner();
+            Class<?> owner = query.runtimeOwner() == null ? loadOwner(query.owner(), loader) : query.runtimeOwner();
             if (query.providerId() != null) return provider(query, owner, loader, registry, codeFingerprint);
             if (query.exactDescriptor() != null) return exact(query, owner, loader);
             return structural(query, owner);
@@ -56,13 +110,11 @@ public final class ReflectionResolver {
         catch (SecurityException denied) { loader = scopeLoader; }
         Class<?>[] parameters = new Class<?>[d.parameters().size()];
         Class<?> type;
-        try {
-            for (int i = 0; i < parameters.length; i++) parameters[i] = d.parameters().get(i).resolve(loader);
-            type = d.type().resolve(loader);
-        } catch (SecurityException denied) {
+        boolean reuse = lookups.get() > 1; // the first lookup of a resolver takes the direct path below
+        try { type = resolveTypes(d, loader, parameters, reuse); }
+        catch (SecurityException denied) {
             if (loader == scopeLoader) throw denied;
-            for (int i = 0; i < parameters.length; i++) parameters[i] = d.parameters().get(i).resolve(scopeLoader);
-            type = d.type().resolve(scopeLoader);
+            type = resolveTypes(d, scopeLoader, parameters, reuse);
         }
         try {
             Member member;
@@ -139,21 +191,28 @@ public final class ReflectionResolver {
     }
     /** Cached structural enumeration; the arrays are never mutated or handed to callers. */
     private Member[] table(Class<?> owner, QuerySpec query) {
-        TableKey key = new TableKey(owner, query.kind(), query.kind() != MemberKind.CONSTRUCTOR && query.hierarchy() == Hierarchy.JAVA_PUBLIC);
+        int shape = TableKey.shape(query.kind(), query.kind() != MemberKind.CONSTRUCTOR && query.hierarchy() == Hierarchy.JAVA_PUBLIC);
+        LastTable last = lastTable;
+        if (last != null && last.owner == owner && last.shape == shape) return last.members;
+        TableKey key = new TableKey(owner, shape);
         synchronized (this) {
             Member[] cached = tables.get(key);
-            if (cached != null) return cached;
+            if (cached != null) { lastTable = new LastTable(owner, shape, cached); return cached; }
         }
         Member[] fresh = members(owner, query);
         int cost = Math.max(1, fresh.length);
         if (cost > schemaCapacity) return fresh;
         synchronized (this) {
             Member[] raced = tables.get(key);
-            if (raced != null) return raced;
+            if (raced != null) { lastTable = new LastTable(owner, shape, raced); return raced; }
             tables.put(key, fresh); tableMembers += cost;
-            for (Iterator<Member[]> eldest = tables.values().iterator(); tableMembers > schemaCapacity; ) {
-                tableMembers -= Math.max(1, eldest.next().length); eldest.remove();
+            // The new table is the tail and fits the capacity alone, so eviction never removes it.
+            if (tableMembers > schemaCapacity) {
+                for (Iterator<Member[]> eldest = tables.values().iterator(); tableMembers > schemaCapacity; ) {
+                    tableMembers -= Math.max(1, eldest.next().length); eldest.remove();
+                }
             }
+            lastTable = new LastTable(owner, shape, fresh);
             return fresh;
         }
     }
@@ -306,12 +365,34 @@ public final class ReflectionResolver {
     }
     private static Outcome failure(ResolutionStatus status, QuerySpec query, String reason, Throwable cause) { return outcome(status, query, Collections.emptyList(), false, 0, reason, cause); }
     private static Outcome outcome(ResolutionStatus status, QuerySpec query, List<Entry> matches, boolean complete, int inspected, String reason, Throwable cause) {
-        return Outcome.trusted(status, matches, new Coverage("java-visible:" + query.owner() + ":" + query.hierarchy(), complete, inspected, reason), reason, cause == null ? null : cause.getClass().getName());
+        return Outcome.trusted(status, matches, new Coverage(universe(query), complete, inspected, reason), reason, cause == null ? null : cause.getClass().getName());
+    }
+    /** {@code "java-visible:" + owner + ":" + hierarchy}, reused while consecutive outcomes share owner and hierarchy. */
+    private static String universe(QuerySpec query) {
+        String owner = query.owner();
+        Hierarchy hierarchy = query.hierarchy();
+        Universe last = lastUniverse;
+        if (last != null && last.hierarchy == hierarchy && (last.owner == owner || last.owner.equals(owner))) return last.text;
+        String text = "java-visible:" + owner + ":" + hierarchy;
+        lastUniverse = new Universe(owner, hierarchy, text);
+        return text;
+    }
+    private static final class Universe {
+        final String owner, text;
+        final Hierarchy hierarchy;
+        Universe(String owner, Hierarchy hierarchy, String text) { this.owner = owner; this.hierarchy = hierarchy; this.text = text; }
+    }
+    private static final class LastTable {
+        final Class<?> owner;
+        final int shape;
+        final Member[] members;
+        LastTable(Class<?> owner, int shape, Member[] members) { this.owner = owner; this.shape = shape; this.members = members; }
     }
     private static final class TableKey {
         final Class<?> owner;
         final int shape;
-        TableKey(Class<?> owner, MemberKind kind, boolean publicLookup) { this.owner = owner; this.shape = kind.ordinal() * 2 + (publicLookup ? 1 : 0); }
+        TableKey(Class<?> owner, int shape) { this.owner = owner; this.shape = shape; }
+        static int shape(MemberKind kind, boolean publicLookup) { return kind.ordinal() * 2 + (publicLookup ? 1 : 0); }
         @Override public boolean equals(Object other) { return other instanceof TableKey && ((TableKey) other).owner == owner && ((TableKey) other).shape == shape; }
         @Override public int hashCode() { return owner.hashCode() * 31 + shape; }
     }

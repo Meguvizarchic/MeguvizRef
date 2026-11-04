@@ -15,8 +15,28 @@ import java.util.concurrent.atomic.*;
 /** Synchronous code lifetime. close rejects new work without waiting for in-flight target methods. */
 public final class CodeScope implements AutoCloseable {
     public enum State { OPEN, RETIRING, CLOSED }
-    /** Sign bit of {@link #admission}; set exactly once by close, under the lock. */
+    /** Sign bit of every admission word; set exactly once per word by close, under the lock. */
     private static final int CLOSING = Integer.MIN_VALUE;
+    /** Bit 30 of the base word only: set under the lock right after {@link #cells} is published. */
+    private static final int INFLATED = 1 << 30;
+    /** In-flight count bits of an admission word. */
+    private static final int COUNT = INFLATED - 1;
+    /** Admission word id of {@link #admission}; cell ids are 1..{@link #CELLS}. */
+    private static final int BASE = 0;
+    /** Power of two at least the processor count (2..64), like Striped64's table bound. */
+    private static final int CELLS = cellCount(Runtime.getRuntime().availableProcessors());
+    /**
+     * Cells sit 32 ints (128 bytes, HotSpot's default @Contended padding width) apart, with a leading and trailing pad,
+     * so no two cells and no neighbouring object share a cache line or an adjacent-line prefetch pair.
+     */
+    private static final int STRIDE = 32;
+    /**
+     * Index of the drain hand-off counter inside the leading pad of {@link #cells}: admission words that still held
+     * work at close, plus one for close itself. Written before the first CLOSING bit; the last releaser of each busy
+     * word and close each take one share, and whoever takes the last closes the providers. Rejected callers never
+     * touch it. Without cells the base word's last releaser alone is the hand-off, as before.
+     */
+    private static final int PENDING = 0;
     /** In-process identities: a per-load random prefix plus a sequence, without SecureRandom per scope. */
     private static final long IDENTITY_PREFIX = new SplittableRandom().nextLong();
     private static final AtomicLong IDENTITY_SEQUENCE = new AtomicLong();
@@ -24,11 +44,21 @@ public final class CodeScope implements AutoCloseable {
     private final AccessPolicy accessPolicy;
     private final int capacity;
     /**
-     * In-flight resolutions/invocations in the low bits, CLOSING in the sign bit. Admission CASes the count only while
-     * CLOSING is clear, so close's getAndAdd is the single linearization point: work admitted before it is counted and
-     * drained, later work is rejected without touching the count.
+     * Base admission word: in-flight resolutions/invocations in the low 30 bits, INFLATED in bit 30, CLOSING in the
+     * sign bit. Plan calls CAS the count only while CLOSING and INFLATED are clear, so the uncontended path reads one
+     * word; resolutions increment it under the lock while OPEN. Until a plan call's CAS on it fails, this is the only
+     * admission word and close's getAndAdd is the single linearization point.
      */
     private final AtomicInteger admission = new AtomicInteger();
+    /**
+     * Padded per-thread admission cells (count and CLOSING, no INFLATED bit), created under the lock once a plan call's
+     * CAS on the base word has failed twice in a row (observed contention) and never replaced. Once the base word
+     * shows INFLATED, plan calls count in a cell chosen by thread id, after that read found the base word open. close
+     * sets CLOSING on the base word first and then on every cell,
+     * so a call that starts after any caller was rejected finds the base word closed: rejections never precede an
+     * admission. A scope that never sees contention never allocates them.
+     */
+    private volatile AtomicIntegerArray cells;
     private ClassLoader loader;
     private State state = State.OPEN;
     private String identity = newIdentity();
@@ -102,7 +132,7 @@ public final class CodeScope implements AutoCloseable {
             context = context();
         }
         try { return (ResolutionResult) coordinate(context, query, query, () -> resolveUncached(query, context)); }
-        finally { release(); }
+        finally { release(BASE); }
     }
     /**
      * Same lookup, statuses and receipt as {@link #resolve}, but returns raw members without creating bindings or
@@ -131,7 +161,7 @@ public final class CodeScope implements AutoCloseable {
             }
             for (Member member : result.members()) prepareAccess(member);
             return result;
-        } finally { release(); }
+        } finally { release(BASE); }
     }
     /** Caller holds the lock with the scope OPEN. */
     private Context context() {
@@ -243,8 +273,9 @@ public final class CodeScope implements AutoCloseable {
     public ConstructorPlan bindConstructor(QuerySpec query) throws IllegalAccessException { return bindConstructor(resolve(query).requireSingle()); }
     private void prepare(ResolvedMember token, MemberKind kind) throws IllegalAccessException {
         if (token.descriptor().kind() != kind) throw new IllegalArgumentException("wrong member kind");
-        Member member = acquire(token);
-        try { prepareAccess(member); } finally { release(); }
+        Member member = bindings.find(token).member;
+        int word = admit();
+        try { prepareAccess(member); } finally { release(word); }
     }
     private void prepareAccess(Member member) throws IllegalAccessException {
         if (accessPolicy != AccessPolicy.TRY_SUPPRESS_JAVA_CHECKS) return;
@@ -255,38 +286,75 @@ public final class CodeScope implements AutoCloseable {
     }
     /** Deliberate ownership escape: this raw reference can outlive close and retain its defining loader. */
     public Member exportRaw(ResolvedMember token) throws IllegalAccessException {
-        Member member = acquire(token);
-        try { prepareAccess(member); return member; } finally { release(); }
+        Member member = bindings.find(token).member;
+        int word = admit();
+        try { prepareAccess(member); return member; } finally { release(word); }
     }
-    /**
-     * Lock-free admission. The token is checked against one bindings snapshot, then the in-flight count is CASed only
-     * while CLOSING is clear. A snapshot read before the CAS cannot be a closed one: close sets CLOSING before replacing
-     * it. A call admitted with a snapshot read just before advanceCodeEpoch is ordered before that epoch change.
+    /*
+     * Lock-free admission. The token is checked against one bindings snapshot, then admit() counts the call in an
+     * admission word whose CLOSING bit is clear. A snapshot read before admission cannot be a closed one: close sets
+     * every CLOSING bit before replacing it. A call admitted with a snapshot read just before advanceCodeEpoch is
+     * ordered before that epoch change.
      */
-    private Member acquire(ResolvedMember token) {
-        Slot slot = bindings.find(token);
-        for (;;) {
-            int value = admission.get();
-            if (value < 0) throw new StalePlanException("scope identity or epoch is stale");
-            if (admission.compareAndSet(value, value + 1)) return slot.member;
-        }
-    }
     public Object invokeMethod(ResolvedMember token, Object receiver, Object[] arguments) throws IllegalAccessException, InvocationTargetException {
-        Member member = acquire(token);
-        try { return ((Method) member).invoke(receiver, arguments); } finally { release(); }
+        Member member = bindings.find(token).member;
+        int word = admit();
+        try { return ((Method) member).invoke(receiver, arguments); } finally { release(word); }
     }
     public Object getField(ResolvedMember token, Object receiver) throws IllegalAccessException {
-        Member member = acquire(token);
-        try { return ((Field) member).get(receiver); } finally { release(); }
+        Member member = bindings.find(token).member;
+        int word = admit();
+        try { return ((Field) member).get(receiver); } finally { release(word); }
     }
     public void setField(ResolvedMember token, Object receiver, Object value) throws IllegalAccessException {
-        Member member = acquire(token);
-        try { ((Field) member).set(receiver, value); } finally { release(); }
+        Member member = bindings.find(token).member;
+        int word = admit();
+        try { ((Field) member).set(receiver, value); } finally { release(word); }
     }
     public Object construct(ResolvedMember token, Object[] arguments) throws IllegalAccessException, InvocationTargetException, InstantiationException {
-        Member member = acquire(token);
-        try { return ((Constructor<?>) member).newInstance(arguments); } finally { release(); }
+        Member member = bindings.find(token).member;
+        int word = admit();
+        try { return ((Constructor<?>) member).newInstance(arguments); } finally { release(word); }
     }
+    /** Uncontended path: one read and one CAS of the base word. Returns the admission word to release. */
+    private int admit() {
+        int value = admission.get();
+        if ((value & (CLOSING | INFLATED)) == 0 && admission.compareAndSet(value, value + 1)) return BASE;
+        return admitContended();
+    }
+    private int admitContended() {
+        for (;;) {
+            int value = admission.get();
+            if (value < 0) throw stale();
+            if ((value & INFLATED) != 0) return admitCell(cells);
+            if (admission.compareAndSet(value, value + 1)) return BASE;
+            inflate(); // a failed CAS is observed contention
+        }
+    }
+    /**
+     * Counts the call in this thread's cell. The caller has just read the base word open: close closes it before any
+     * cell, so this call is linearized at that read (before close) even if its cell CAS lands later, and the cell's
+     * own CLOSING bit then tells whether close has already taken that cell's count.
+     */
+    private int admitCell(AtomicIntegerArray table) {
+        @SuppressWarnings("deprecation") // threadId() is JDK 19+; getId() is the same value and exists on Android
+        int cell = (int) Thread.currentThread().getId() & (CELLS - 1);
+        for (;;) {
+            int index = (cell + 1) * STRIDE, value = table.get(index);
+            if (value < 0) throw stale();
+            if (table.compareAndSet(index, value, value + 1)) return cell + 1;
+            cell = (cell + 1) & (CELLS - 1); // collided with another thread: probe the next cell
+        }
+    }
+    /** Under the lock, so close sees either no cells or the final table; a closing scope never inflates. */
+    private void inflate() {
+        synchronized (lock) {
+            // cells is written before INFLATED, so a caller that reads INFLATED also sees the table.
+            if (cells == null && state == State.OPEN) { cells = new AtomicIntegerArray((CELLS + 2) * STRIDE); admission.getAndAdd(INFLATED); }
+        }
+    }
+    private static StalePlanException stale() { return new StalePlanException("scope identity or epoch is stale"); }
+    private static int cellCount(int processors) { return Math.min(64, Integer.highestOneBit(Math.max(1, processors - 1)) << 1); }
     public void advanceCodeEpoch(String reason) {
         if (reason == null || reason.isEmpty()) throw new IllegalArgumentException("invalidation reason");
         QueryCoordinator<Object, Object> oldCoordinator;
@@ -306,20 +374,38 @@ public final class CodeScope implements AutoCloseable {
             values.put("cacheHits", cacheHits + (recentHits == null ? 0 : recentHits.sum())); values.put("cachedQueries", (long) cache.size()); values.put("bindings", (long) bindings.size);
             values.put("schemas", resolver == null ? 0L : (long) resolver.schemaSize()); values.put("parameterReads", resolver == null ? 0L : resolver.parameterReads());
             values.put("candidateChecks", resolver == null ? 0L : resolver.candidateChecks()); values.put("lookups", resolver == null ? 0L : resolver.lookups());
-            values.put("inFlight", (long) (admission.get() & Integer.MAX_VALUE));
+            values.put("inFlight", inFlight());
             return Collections.unmodifiableMap(values);
         }
+    }
+    /** Sum of all admission words; like LongAdder.sum(), exact when no call starts or ends during the read. */
+    private long inFlight() {
+        long total = admission.get() & COUNT;
+        AtomicIntegerArray table = cells;
+        if (table != null) for (int cell = 1; cell <= CELLS; cell++) total += table.get(cell * STRIDE) & COUNT;
+        return total;
     }
     @Override public void close() {
         ProviderRegistry retired = null;
         QueryCoordinator<Object, Object> previous;
         synchronized (lock) {
             if (state != State.OPEN) return;
-            int inFlight = admission.getAndAdd(CLOSING); // linearization point; OPEN implies CLOSING was clear
+            AtomicIntegerArray table = cells;
+            boolean drained;
+            // Linearization point: the base word first, so no call can start after a rejection and still be admitted.
+            if (table == null) drained = admission.getAndAdd(CLOSING) == 0;
+            else {
+                // Published to releasers by the CLOSING read-modify-writes below, which they observe before taking a share.
+                table.lazySet(PENDING, CELLS + 2);
+                int idle = (admission.getAndAdd(CLOSING) & COUNT) == 0 ? 1 : 0;
+                for (int cell = 1; cell <= CELLS; cell++) if (table.getAndAdd(cell * STRIDE, CLOSING) == 0) idle++;
+                // With every word idle no releaser can take a share, so close owns the hand-off without touching it.
+                drained = idle == CELLS + 1 || table.addAndGet(PENDING, -(idle + 1)) == 0;
+            }
             state = State.RETIRING; loader = null; bindings = Bindings.CLOSED; cache.clear(); if (recent != null) recent = null; memberSlots.clear(); codeFingerprint = null;
             if (resolver != null) resolver.clear();
             previous = coordinator;
-            if (inFlight == 0) { state = State.CLOSED; retired = providers; providers = null; }
+            if (drained) { state = State.CLOSED; retired = providers; providers = null; }
         }
         if (previous != null) previous.close();
         if (retired != null) {
@@ -331,12 +417,21 @@ public final class CodeScope implements AutoCloseable {
             }
         }
     }
-    private void release() {
-        // Only the release that drains the last admitted work after close observes exactly CLOSING.
-        if (admission.decrementAndGet() != CLOSING) return;
+    private void release(int word) {
+        // Only the release that drains the last admitted work of a word after close sees CLOSING with a zero count.
+        int value = word == BASE ? admission.decrementAndGet() : cells.decrementAndGet(word * STRIDE);
+        if (value < 0 && (value & COUNT) == 0) drained();
+    }
+    /**
+     * One admission word has drained after close; the last share of the hand-off closes the providers. Cells are
+     * never created after close, so this sees the table close saw.
+     */
+    private void drained() {
+        AtomicIntegerArray table = cells;
+        if (table != null && table.decrementAndGet(PENDING) != 0) return;
         ProviderRegistry retired = null;
         synchronized (lock) {
-            if (state == State.RETIRING && admission.get() == CLOSING) {
+            if (state == State.RETIRING) {
                 state = State.CLOSED; retired = providers; providers = null;
                 if (resolver != null) resolver.clear();
             }

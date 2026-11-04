@@ -14,7 +14,7 @@ public final class MemberDescriptor {
     /** {@code parameters} must be a fresh list owned by this instance; it is wrapped, not copied. */
     private MemberDescriptor(MemberKind kind, String owner, String name, TypeDescriptor type, List<TypeDescriptor> parameters) {
         this.kind = Objects.requireNonNull(kind);
-        TypeDescriptor.of("L" + Objects.requireNonNull(owner).replace('.', '/') + ";");
+        TypeDescriptor.validateOwner(Objects.requireNonNull(owner)); // same checks as of("L" + owner.replace('.', '/') + ";")
         // Equals the old substring/replace round trip: every '/' becomes '.', and '.' stays.
         this.owner = owner.replace('/', '.');
         this.name = Objects.requireNonNull(name);

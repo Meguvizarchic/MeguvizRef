@@ -2,6 +2,7 @@ package io.github.jichuo1.meguviz.ref.bench;
 
 import io.github.jichuo1.meguviz.ref.api.descriptor.MemberDescriptor;
 import io.github.jichuo1.meguviz.ref.api.descriptor.MemberKind;
+import io.github.jichuo1.meguviz.ref.api.descriptor.TypeDescriptor;
 import io.github.jichuo1.meguviz.ref.api.query.QuerySpec;
 import io.github.jichuo1.meguviz.ref.api.query.Selection;
 import io.github.jichuo1.meguviz.ref.runtime.resolve.MethodSchema;
@@ -17,6 +18,8 @@ public class DescriptorBenchmark {
     Method threeInts, oneString;
     MemberDescriptor descriptor;
     QuerySpec query;
+    final TypeDescriptor stringType = TypeDescriptor.of("Ljava/lang/String;");
+    final ClassLoader appLoader = WideTarget.class.getClassLoader();
 
     @Setup
     public void setUp() throws Exception {
@@ -41,6 +44,10 @@ public class DescriptorBenchmark {
 
     @Benchmark
     public String querySummary() { return query.summary(); }
+
+    /** One reference type of an exact descriptor, resolved through the owner's (application) loader on every miss. */
+    @Benchmark
+    public Class<?> typeResolveReference() throws Exception { return stringType.resolve(appLoader); }
 
     /** The Hook bridge builds one query like this per resolve. */
     @Benchmark

@@ -37,6 +37,7 @@ public final class CoreContractTest {
         providerArityContracts();
         concurrencyContracts();
         scopeFastPathContracts();
+        stripedAdmissionContracts();
         memberTableContracts();
         recentHitContracts();
         descriptorFastPathContracts();
@@ -296,6 +297,64 @@ public final class CoreContractTest {
                 eq(ResolutionStatus.PARTIAL, overflow.status()); eq("binding_capacity", overflow.receipt().reason());
                 eq(first, scope.exportRaw(at).getDeclaringClass()); eq(second, scope.exportRaw(bt).getDeclaringClass());
                 eq(2L, scope.diagnostics().get("bindings"));
+            }
+        });
+        test("exact-type-cache-keyed-by-initiating-loader", () -> {
+            try (URLClassLoader parent = isolated(fixtures); ChildFirstLoader mixed = new ChildFirstLoader(fixtures.toUri().toURL(), parent, "fixture.ShadowParam", "fixture.ShadowPeer")) {
+                Class<?> parentOwner = Class.forName("fixture.ShadowOwner", false, mixed), peer = Class.forName("fixture.ShadowPeer", false, mixed);
+                Class<?> parentParam = Class.forName("fixture.ShadowParam", false, parent), childParam = Class.forName("fixture.ShadowParam", false, mixed);
+                check(parentOwner.getClassLoader() == parent && peer.getClassLoader() == mixed && parentParam != childParam, "fixture arrangement");
+                MemberDescriptor ownerMethod = MemberDescriptor.method("fixture.ShadowOwner", "method", "Lfixture/ShadowParam;", "Lfixture/ShadowParam;");
+                MemberDescriptor peerMethod = MemberDescriptor.method("fixture.ShadowPeer", "method", "Lfixture/ShadowParam;", "Lfixture/ShadowParam;");
+                for (boolean ownerFirst : new boolean[]{true, false}) {
+                    try (CodeScope scope = CodeScope.open(mixed)) {
+                        for (int round = 0; round < 3; round++) for (int i = 0; i < 2; i++) {
+                            boolean owner = (i == 0) == ownerFirst;
+                            RawResolution raw = scope.resolveRaw(QuerySpec.exact(owner ? ownerMethod : peerMethod));
+                            eq(ResolutionStatus.RESOLVED, raw.status()); Method method = (Method) raw.members().get(0);
+                            eq(owner ? parentOwner : peer, method.getDeclaringClass());
+                            eq(owner ? parentParam : childParam, method.getParameterTypes()[0]); eq(owner ? parentParam : childParam, method.getReturnType());
+                        }
+                        Map<?, ?> cache = loadedTypes(scope); eq(2, cache.size()); check(cache.containsKey(parent) && cache.containsKey(mixed), "one entry set per initiating loader");
+                        eq(parentParam, ((Map<?, ?>) cache.get(parent)).get("Lfixture/ShadowParam;")); eq(childParam, ((Map<?, ?>) cache.get(mixed)).get("Lfixture/ShadowParam;"));
+                        eq(parentOwner, ((Map<?, ?>) cache.get(mixed)).get("fixture.ShadowOwner")); eq(peer, ((Map<?, ?>) cache.get(mixed)).get("fixture.ShadowPeer"));
+                        scope.advanceCodeEpoch("types"); eq(null, loadedTypes(scope));
+                        eq(ResolutionStatus.RESOLVED, scope.resolveRaw(QuerySpec.exact(peerMethod)).status()); eq(null, loadedTypes(scope)); // first lookup of a resolver is uncached
+                        eq(ResolutionStatus.RESOLVED, scope.resolveRaw(QuerySpec.exact(peerMethod)).status()); eq(1, loadedTypes(scope).size());
+                        scope.close(); eq(null, loadedTypes(scope));
+                    }
+                }
+            }
+        });
+        test("exact-type-cache-has-no-negative-entries-and-is-bounded", () -> {
+            try (URLClassLoader parent = isolated(fixtures); FlakyLoader flaky = new FlakyLoader(fixtures.toUri().toURL(), parent, "fixture.ShadowParam")) {
+                MemberDescriptor peerMethod = MemberDescriptor.method("fixture.ShadowPeer", "method", "Lfixture/ShadowParam;", "Lfixture/ShadowParam;");
+                try (CodeScope scope = CodeScope.open(flaky)) {
+                    ResolutionResult first = scope.resolve(QuerySpec.exact(peerMethod));
+                    eq(ResolutionStatus.UNAVAILABLE, first.status()); eq("owner_type_unavailable", first.receipt().reason()); eq(1, flaky.failures.get());
+                    eq(ResolutionStatus.RESOLVED, scope.resolve(QuerySpec.exact(peerMethod)).status()); // the failure was not cached
+                }
+            }
+            // The same failure on the cached path: an unrelated first lookup makes the failing one the resolver's second.
+            try (URLClassLoader parent = isolated(fixtures); FlakyLoader flaky = new FlakyLoader(fixtures.toUri().toURL(), parent, "fixture.ShadowParam")) {
+                MemberDescriptor peerMethod = MemberDescriptor.method("fixture.ShadowPeer", "method", "Lfixture/ShadowParam;", "Lfixture/ShadowParam;");
+                Class<?> parentParam = Class.forName("fixture.ShadowParam", false, parent);
+                try (CodeScope scope = CodeScope.open(flaky)) {
+                    eq(ResolutionStatus.RESOLVED, scope.resolveRaw(QuerySpec.exact(MemberDescriptor.method("java.lang.String", "length", "I"))).status());
+                    eq(null, loadedTypes(scope)); eq(0, flaky.failures.get());
+                    ResolutionResult failed = scope.resolve(QuerySpec.exact(peerMethod));
+                    eq(ResolutionStatus.UNAVAILABLE, failed.status()); eq("owner_type_unavailable", failed.receipt().reason()); eq(1, flaky.failures.get());
+                    Map<?, ?> names = (Map<?, ?>) loadedTypes(scope).get(flaky);
+                    check(names.containsKey("fixture.ShadowPeer") && !names.containsKey("Lfixture/ShadowParam;"), "only the successful owner lookup is cached: " + names.keySet());
+                    RawResolution resolved = scope.resolveRaw(QuerySpec.exact(peerMethod));
+                    eq(ResolutionStatus.RESOLVED, resolved.status()); eq(parentParam, ((Method) resolved.members().get(0)).getParameterTypes()[0]);
+                    eq(parentParam, ((Map<?, ?>) loadedTypes(scope).get(flaky)).get("Lfixture/ShadowParam;"));
+                }
+            }
+            try (CodeScope small = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 3)) {
+                for (Method method : String.class.getDeclaredMethods()) if (Modifier.isPublic(method.getModifiers())) small.resolveRaw(QuerySpec.exact(MemberDescriptor.from(method)));
+                int entries = 0; for (Object names : loadedTypes(small).values()) entries += ((Map<?, ?>) names).size();
+                eq(3, entries);
             }
         });
         test("loader-shadow-exact-provider-and-structural-use-owner-signature-identity", () -> {
@@ -744,6 +803,29 @@ public final class CoreContractTest {
                 await(provider.entered); provider.exit.countDown(); for (Future<ResolutionResult> future : futures) future.get(3, TimeUnit.SECONDS).requireSingle(); eq(1, provider.discoveries.get());
             } finally { provider.exit.countDown(); executor.shutdownNow(); }
         });
+        test("single-flight-future-created-only-for-waiters", () -> {
+            QueryCoordinator<String,Integer> coordinator = new QueryCoordinator<>(4); CountDownLatch entered = new CountDownLatch(1), exit = new CountDownLatch(1);
+            ExecutorService executor = Executors.newFixedThreadPool(2); Field flights = field(QueryCoordinator.class, "flights");
+            try {
+                eq(5, coordinator.execute("solo", () -> 5, 100)); eq(0, ((Map<?, ?>) flights.get(coordinator)).size());
+                Future<Integer> owner = executor.submit(() -> coordinator.execute("q", () -> { entered.countDown(); blockingAwait(exit); return 7; }, 1000)); await(entered);
+                Object flight; synchronized (coordinator) { flight = ((Map<?, ?>) flights.get(coordinator)).get("q"); }
+                Field future = field(flight.getClass(), "future"); synchronized (coordinator) { eq(null, future.get(flight)); }
+                Future<Integer> waiter = executor.submit(() -> coordinator.execute("q", () -> 8, 2000));
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2); Object created = null;
+                while (created == null && System.nanoTime() < deadline) { synchronized (coordinator) { created = future.get(flight); } Thread.yield(); }
+                check(created != null, "first waiter created the future"); exit.countDown();
+                eq(7, owner.get(3, TimeUnit.SECONDS)); eq(7, waiter.get(3, TimeUnit.SECONDS)); eq(0, ((Map<?, ?>) flights.get(coordinator)).size());
+                RuntimeException failure = new IllegalStateException("owner failed"); CountDownLatch failing = new CountDownLatch(1), release = new CountDownLatch(1);
+                Future<Integer> failedOwner = executor.submit(() -> coordinator.execute("f", () -> { failing.countDown(); blockingAwait(release); throw failure; }, 1000)); await(failing);
+                Future<Integer> failedWaiter = executor.submit(() -> coordinator.execute("f", () -> 9, 2000));
+                deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2); boolean attached = false;
+                while (!attached && System.nanoTime() < deadline) { synchronized (coordinator) { Object f = ((Map<?, ?>) flights.get(coordinator)).get("f"); attached = f != null && future.get(f) != null; } Thread.yield(); }
+                check(attached, "waiter attached"); release.countDown();
+                check(expect(ExecutionException.class, () -> failedOwner.get(3, TimeUnit.SECONDS)).getCause() == failure, "owner sees its failure");
+                check(expect(ExecutionException.class, () -> failedWaiter.get(3, TimeUnit.SECONDS)).getCause() == failure, "waiter sees the owner failure");
+            } finally { exit.countDown(); coordinator.close(); executor.shutdownNow(); }
+        });
         test("single-flight-reentrant-does-not-deadlock", () -> {
             QueryCoordinator<String,Integer> coordinator = new QueryCoordinator<>(4);
             expect(IllegalStateException.class, () -> coordinator.execute("q", () -> { try { return coordinator.execute("q", () -> 2, 100); } catch (InterruptedException | TimeoutException e) { throw new AssertionError(e); } }, 100));
@@ -943,6 +1025,176 @@ public final class CoreContractTest {
             CodeScope unused = CodeScope.open(LOADER); unused.advanceCodeEpoch("never resolved"); eq(1L, unused.codeEpoch()); unused.close(); eq(CodeScope.State.CLOSED, unused.state());
         });
     }
+    private static void stripedAdmissionContracts() {
+        test("striped-admission-inflates-only-on-observed-contention", () -> {
+            QuerySpec run = QuerySpec.exact(MemberDescriptor.method(Counting.class.getName(), "run", "I"));
+            CodeScope quiet = CodeScope.open(LOADER); MethodPlan plan = quiet.bindMethod(quiet.resolve(run).requireSingle()); Counting counting = new Counting();
+            for (int i = 0; i < 20000; i++) eq(1, plan.invoke(counting, new Object[0]));
+            eq(null, cells(quiet)); quiet.close(); eq(null, cells(quiet));
+            for (int i = 0; i < 200; i++) { CodeScope scope = CodeScope.open(LOADER); scope.close(); eq(null, cells(scope)); }
+            CodeScope busy = CodeScope.open(LOADER); MethodPlan shared = busy.bindMethod(busy.resolve(run).requireSingle()); Counting target = new Counting();
+            AtomicLong admitted = new AtomicLong(); AtomicReference<Throwable> failure = new AtomicReference<>(); List<Thread> workers = new ArrayList<>();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            for (int w = 0; w < 4; w++) {
+                Thread worker = new Thread(() -> {
+                    try { while (System.nanoTime() < deadline && cellsOrNull(busy) == null) for (int i = 0; i < 256; i++) { shared.invoke(target, new Object[0]); admitted.incrementAndGet(); } }
+                    catch (Throwable error) { failure.set(error); }
+                });
+                worker.setDaemon(true); workers.add(worker); worker.start();
+            }
+            for (Thread worker : workers) { worker.join(15000); check(!worker.isAlive(), "worker stopped"); }
+            eq(null, failure.get()); AtomicIntegerArray table = cells(busy); check(table != null, "a failed base CAS inflated the cells");
+            int count = (Integer) field(CodeScope.class, "CELLS").get(null), stride = (Integer) field(CodeScope.class, "STRIDE").get(null);
+            check(Integer.bitCount(count) == 1 && count >= 2 && count <= 64 && count >= Math.min(64, Runtime.getRuntime().availableProcessors()), "cell count " + count);
+            eq(32, stride); eq((count + 2) * stride, table.length());
+            eq((long) target.calls.get(), admitted.get()); eq(0L, busy.diagnostics().get("inFlight"));
+            check(cells(busy) == table, "cells are never replaced"); busy.close(); eq(CodeScope.State.CLOSED, busy.state());
+            for (int cell = 1; cell <= count; cell++) eq(Integer.MIN_VALUE, table.get(cell * stride));
+        });
+        for (boolean baseLast : new boolean[]{false, true}) test("striped-admission-close-drains-cells-and-base-before-provider-close" + (baseLast ? "-base-last" : "-cells-last"), () -> {
+            Provider provider = new Provider("p", ""); provider.entered = new CountDownLatch(1); provider.exit = new CountDownLatch(1);
+            CodeScope scope = providerScope(provider); inflate(scope); ExecutorService executor = Executors.newFixedThreadPool(4);
+            Blocking[] targets = {new Blocking(), new Blocking(), new Blocking()};
+            try {
+                MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Blocking.class.getName(), "run", "I"))).requireSingle());
+                List<Future<Object>> calls = new ArrayList<>();
+                for (Blocking target : targets) { calls.add(executor.submit(() -> plan.invoke(target, new Object[0]))); await(target.entered); }
+                eq(3L, cellCounts(scope)); // plan calls count in cells once they exist
+                Future<ResolutionResult> resolving = executor.submit(() -> scope.resolve(providerQuery())); await(provider.entered);
+                eq(4L, scope.diagnostics().get("inFlight"));
+                scope.close(); eq(CodeScope.State.RETIRING, scope.state()); eq(0, provider.closes.get());
+                Blocking late = new Blocking(); late.exit.countDown();
+                eq("scope identity or epoch is stale", expect(StalePlanException.class, () -> plan.invoke(late, new Object[0])).getMessage());
+                eq(1L, late.entered.getCount()); eq(4L, scope.diagnostics().get("inFlight"));
+                if (baseLast) { for (int i = 0; i < 3; i++) { targets[i].exit.countDown(); eq(1, calls.get(i).get(3, TimeUnit.SECONDS)); eq(0, provider.closes.get()); } }
+                else { targets[0].exit.countDown(); eq(1, calls.get(0).get(3, TimeUnit.SECONDS)); }
+                eq(CodeScope.State.RETIRING, scope.state());
+                provider.exit.countDown(); ResolutionResult stale = resolving.get(3, TimeUnit.SECONDS); eq(ResolutionStatus.STALE, stale.status());
+                if (!baseLast) {
+                    eq(0, provider.closes.get()); targets[1].exit.countDown(); eq(1, calls.get(1).get(3, TimeUnit.SECONDS)); eq(0, provider.closes.get());
+                    eq(1L, scope.diagnostics().get("inFlight")); targets[2].exit.countDown(); eq(1, calls.get(2).get(3, TimeUnit.SECONDS));
+                }
+                eq(1, provider.closes.get()); eq(CodeScope.State.CLOSED, scope.state()); eq(0L, scope.diagnostics().get("inFlight"));
+                scope.close(); eq(1, provider.closes.get());
+            } finally { provider.exit.countDown(); for (Blocking target : targets) target.exit.countDown(); scope.close(); executor.shutdownNow(); }
+        });
+        test("striped-admission-cell-call-checks-base-word-first", () -> {
+            // White-box: the state close leaves after its first step (base word closed, cells still open).
+            try (CodeScope scope = CodeScope.open(LOADER)) {
+                inflate(scope); MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Counting.class.getName(), "run", "I"))).requireSingle());
+                Counting counting = new Counting(); eq(1, plan.invoke(counting, new Object[0])); eq(1, counting.calls.get());
+                AtomicInteger base = (AtomicInteger) field(CodeScope.class, "admission").get(scope); base.getAndAdd(Integer.MIN_VALUE);
+                try {
+                    for (int t = 0; t < 4; t++) {
+                        AtomicReference<Throwable> outcome = new AtomicReference<>();
+                        Thread caller = new Thread(() -> { try { plan.invoke(counting, new Object[0]); } catch (Throwable error) { outcome.set(error); } });
+                        caller.start(); caller.join(3000);
+                        check(outcome.get() instanceof StalePlanException, "rejected while the base word is closed: " + outcome.get());
+                        eq("scope identity or epoch is stale", outcome.get().getMessage());
+                    }
+                    eq(1, counting.calls.get()); eq(0L, cellCounts(scope));
+                } finally { base.getAndAdd(Integer.MIN_VALUE); }
+                eq(1, plan.invoke(counting, new Object[0]));
+            }
+        });
+        test("striped-admission-close-sets-base-word-before-cells", () -> {
+            for (int round = 0; round < 200; round++) {
+                CodeScope scope = CodeScope.open(LOADER); inflate(scope);
+                AtomicInteger base = (AtomicInteger) field(CodeScope.class, "admission").get(scope); AtomicIntegerArray table = cells(scope);
+                int count = (Integer) field(CodeScope.class, "CELLS").get(null), stride = (Integer) field(CodeScope.class, "STRIDE").get(null);
+                AtomicInteger violations = new AtomicInteger(); AtomicBoolean closeReturned = new AtomicBoolean(); CountDownLatch watching = new CountDownLatch(1);
+                Thread observer = new Thread(() -> {
+                    watching.countDown();
+                    for (boolean last = false; !last; ) {
+                        last = closeReturned.get();
+                        // Reading a closed cell and then an open base word proves the cell was closed first.
+                        for (int cell = count; cell >= 1; cell--) if (table.get(cell * stride) < 0 && base.get() >= 0) violations.incrementAndGet();
+                    }
+                });
+                observer.setDaemon(true); observer.start(); await(watching); scope.close(); closeReturned.set(true); observer.join(6000);
+                check(!observer.isAlive(), "observer stopped"); eq(0, violations.get());
+                check(base.get() < 0, "base word closed"); for (int cell = 1; cell <= count; cell++) check(table.get(cell * stride) < 0, "cell " + cell + " closed");
+            }
+        });
+        test("striped-admission-close-race-stress-natural-contention", () -> admissionCloseRace(false, 100));
+        test("striped-admission-close-race-stress-inflated", () -> admissionCloseRace(true, 150));
+        test("striped-admission-concurrent-closers-close-providers-once", () -> {
+            for (int round = 0; round < 100; round++) {
+                Provider provider = new Provider("p", ""); CodeScope scope = providerScope(provider); if (round % 2 == 0) inflate(scope);
+                MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Counting.class.getName(), "run", "I"))).requireSingle());
+                Counting counting = new Counting(); AtomicReference<Throwable> failure = new AtomicReference<>(); CountDownLatch start = new CountDownLatch(1);
+                List<Thread> threads = new ArrayList<>();
+                for (int t = 0; t < 6; t++) {
+                    boolean closer = t % 2 == 0; long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                    Thread thread = new Thread(() -> {
+                        try {
+                            start.await();
+                            if (closer) { scope.close(); return; }
+                            for (;;) { if (System.nanoTime() > deadline) throw new AssertionError("caller never rejected"); try { plan.invoke(counting, new Object[0]); } catch (StalePlanException stale) { return; } }
+                        } catch (Throwable error) { failure.set(error); }
+                    });
+                    thread.setDaemon(true); threads.add(thread); thread.start();
+                }
+                start.countDown(); for (Thread thread : threads) { thread.join(6000); check(!thread.isAlive(), "thread stopped"); }
+                eq(null, failure.get()); eq(1, provider.closes.get()); eq(CodeScope.State.CLOSED, scope.state()); eq(0L, scope.diagnostics().get("inFlight"));
+            }
+        });
+    }
+    /**
+     * Close races calls from four workers. Violations: a provider closed with a target in flight or by a caller that
+     * was not admitted, a call admitted after close returned or after another caller had already been rejected, and
+     * any provider close count other than one.
+     */
+    private static void admissionCloseRace(boolean inflated, int rounds) throws Exception {
+        Thread main = Thread.currentThread();
+        for (int round = 0; round < rounds; round++) {
+            Provider provider = new Provider("p", ""); CodeScope scope = providerScope(provider); Counting counting = new Counting();
+            if (inflated) inflate(scope);
+            AtomicInteger violations = new AtomicInteger(); AtomicBoolean closeReturned = new AtomicBoolean(), rejectedSeen = new AtomicBoolean();
+            provider.onClose = () -> {
+                if (counting.inFlight.get() != 0) violations.incrementAndGet();
+                if (Thread.currentThread() != main && !Counting.ADMITTED.get()) violations.incrementAndGet();
+                counting.providerClosed.set(true);
+            };
+            MethodPlan plan = scope.bindMethod(scope.resolve(QuerySpec.exact(MemberDescriptor.method(Counting.class.getName(), "run", "I"))).requireSingle());
+            CountDownLatch running = new CountDownLatch(4); List<Thread> workers = new ArrayList<>(); AtomicReference<Throwable> failure = new AtomicReference<>();
+            for (int w = 0; w < 4; w++) {
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                Thread worker = new Thread(() -> {
+                    boolean first = true;
+                    try {
+                        for (;;) {
+                            if (System.nanoTime() > deadline) { violations.incrementAndGet(); return; }
+                            boolean afterRejection = rejectedSeen.get(), late = closeReturned.get(); Counting.ADMITTED.set(false);
+                            try { plan.invoke(counting, new Object[0]); }
+                            catch (StalePlanException stale) { rejectedSeen.set(true); if (Counting.ADMITTED.get()) violations.incrementAndGet(); return; }
+                            if (late || afterRejection) violations.incrementAndGet();
+                            if (first) { first = false; running.countDown(); }
+                        }
+                    } catch (Throwable error) { failure.set(error); }
+                    finally { if (first) running.countDown(); }
+                });
+                worker.setDaemon(true); workers.add(worker); worker.start();
+            }
+            await(running); for (int spin = round % 7; spin > 0; spin--) Thread.yield();
+            scope.close(); closeReturned.set(true);
+            for (Thread worker : workers) { worker.join(6000); check(!worker.isAlive(), "worker stopped after close"); }
+            eq(null, failure.get()); eq(0, violations.get()); eq(0, counting.enteredAfterProviderClose.get());
+            eq(1, provider.closes.get()); eq(CodeScope.State.CLOSED, scope.state()); eq(0L, scope.diagnostics().get("inFlight"));
+        }
+    }
+    private static Field field(Class<?> owner, String name) throws NoSuchFieldException { Field field = owner.getDeclaredField(name); field.setAccessible(true); return field; }
+    private static AtomicIntegerArray cells(CodeScope scope) throws ReflectiveOperationException { return (AtomicIntegerArray) field(CodeScope.class, "cells").get(scope); }
+    private static AtomicIntegerArray cellsOrNull(CodeScope scope) { try { return cells(scope); } catch (ReflectiveOperationException e) { throw new AssertionError(e); } }
+    /** White-box: the same inflation a failed base CAS triggers, so cell paths are exercised deterministically. */
+    private static void inflate(CodeScope scope) throws ReflectiveOperationException {
+        Method inflate = CodeScope.class.getDeclaredMethod("inflate"); inflate.setAccessible(true); inflate.invoke(scope); check(cells(scope) != null, "inflated");
+    }
+    private static long cellCounts(CodeScope scope) throws ReflectiveOperationException {
+        AtomicIntegerArray table = cells(scope); int count = (Integer) field(CodeScope.class, "CELLS").get(null), stride = (Integer) field(CodeScope.class, "STRIDE").get(null); long total = 0;
+        for (int cell = 1; cell <= count; cell++) total += table.get(cell * stride) & Integer.MAX_VALUE;
+        return total;
+    }
     private static void recentHitContracts() {
         test("recent-hit-memo-counts-and-keeps-lru", () -> {
             try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 2)) {
@@ -964,7 +1216,9 @@ public final class CoreContractTest {
                 eq(ResolutionStatus.RESOLVED, scope.resolve(c).status()); // evicts a: b was used after a
                 long lookups = scope.diagnostics().get("lookups");
                 check(scope.resolve(b) == rb, "b still cached"); eq(lookups, scope.diagnostics().get("lookups"));
-                scope.resolve(a); eq(lookups + 1, scope.diagnostics().get("lookups"));
+                scope.resolve(a); eq(lookups + 1, scope.diagnostics().get("lookups")); // evicts c: b was used after c's put
+                check(scope.resolve(b) == rb, "b survived a's put"); eq(lookups + 1, scope.diagnostics().get("lookups"));
+                scope.resolve(c); eq(lookups + 2, scope.diagnostics().get("lookups"));
             }
         });
         test("recent-hit-memo-interrupt-closed-and-epoch", () -> {
@@ -1057,6 +1311,40 @@ public final class CoreContractTest {
                 check(memberTables(scope) <= target + arity, "bounded");
             }
         });
+        test("member-table-memo-follows-lru-tail", () -> {
+            int target = Target.class.getDeclaredMethods().length, arity = ArityFixture.class.getDeclaredMethods().length, child = Child.class.getDeclaredMethods().length;
+            try (CodeScope scope = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, Math.max(target + arity, Math.max(target, arity) + child))) {
+                scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").build()).requireSingle();
+                scope.resolve(QuerySpec.builder(ArityFixture.class, MemberKind.METHOD).name("choose").parameterCount(0).build()).requireSingle();
+                for (int i = 0; i < 3; i++) scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("one").candidateBudget(5000 + i).build()).requireSingle();
+                for (int i = 0; i < 3; i++) scope.resolve(QuerySpec.builder(ArityFixture.class, MemberKind.METHOD).name("choose").parameterCount(1).candidateBudget(5000 + i).build());
+                eq(target + arity, memberTables(scope));
+                scope.resolve(QuerySpec.builder(Child.class, MemberKind.METHOD).name("covariant").bridge(false).build()).requireSingle();
+                eq(arity + child, memberTables(scope)); // Target was least recently used
+            }
+        });
+        test("member-table-memo-cleared-with-tables", () -> {
+            CodeScope scope = CodeScope.open(LOADER);
+            scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").build()).requireSingle();
+            Object first = field(CodeScope.class, "resolver").get(scope); Field last = field(ReflectionResolver.class, "lastTable");
+            check(last.get(first) != null, "memo set by the lookup");
+            scope.advanceCodeEpoch("memo"); eq(null, last.get(first)); eq(0, memberTables(scope));
+            scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("one").build()).requireSingle();
+            Object second = field(CodeScope.class, "resolver").get(scope); check(last.get(second) != null, "new resolver memo");
+            scope.close(); eq(null, last.get(second)); eq(0, memberTables(scope));
+        });
+        test("coverage-universe-text-unchanged-across-owners-and-hierarchies", () -> {
+            try (CodeScope scope = CodeScope.open(LOADER)) {
+                for (int round = 0; round < 3; round++)
+                    for (Class<?> owner : new Class<?>[]{Target.class, Child.class, Target.class, ArityFixture.class})
+                        for (Hierarchy hierarchy : Hierarchy.values()) {
+                            QuerySpec query = QuerySpec.builder(owner, MemberKind.METHOD).name("pick").selection(Selection.ALL).hierarchy(hierarchy).candidateBudget(1000 + round).build();
+                            eq("java-visible:" + owner.getName() + ":" + hierarchy, scope.resolve(query).receipt().coverage().universe());
+                            QuerySpec named = QuerySpec.builder(new String(owner.getName()), MemberKind.METHOD).name("zero").hierarchy(hierarchy).candidateBudget(1000 + round).build();
+                            eq("java-visible:" + owner.getName() + ":" + hierarchy, scope.resolve(named).receipt().coverage().universe());
+                        }
+            }
+        });
         test("member-table-cache-cleared-by-epoch-and-close", () -> {
             CodeScope scope = CodeScope.open(LOADER);
             scope.resolve(QuerySpec.builder(Target.class, MemberKind.METHOD).name("zero").build()).requireSingle(); check(memberTables(scope) > 0, "retained");
@@ -1103,10 +1391,15 @@ public final class CoreContractTest {
         test("owner-normalization-matches-previous-implementation", () -> {
             Runnable lambda = () -> { };
             String hidden = lambda.getClass().getName(); check(hidden.indexOf('/') > 0, "lambda proxy is a hidden class: " + hidden);
-            for (String owner : new String[]{"java.lang.String", "java/lang/String", "a.b/c", hidden, "a..b", "a//b", ".a", "a.", "/a", "a/", "a;b", "a b", "a[]", "", "x".repeat(4094), "x".repeat(4095)}) {
+            List<String> owners = new ArrayList<>(Arrays.asList("java.lang.String", "java/lang/String", "a.b/c", hidden, "a..b", "a//b", "a./b", "a/.b", ".a", "a.", "/a", "a/", ".", "/", "a;b", "a b", "a\tb", "a\u2003b", "a\u00a0b", "a[]", "a(b", "a)b", "L", ";", "", "x".repeat(4094), "x".repeat(4095), "x".repeat(4093) + ".", "." + "x".repeat(4094)));
+            Random random = new Random(7); String alphabet = "./;[()ab L$\t\u2003\u00a0";
+            for (int i = 0; i < 20000; i++) { StringBuilder value = new StringBuilder(); int length = random.nextInt(7); for (int c = 0; c < length; c++) value.append(alphabet.charAt(random.nextInt(alphabet.length()))); owners.add(value.toString()); }
+            for (String owner : owners) {
                 eq(outcome(() -> previousOwner(owner)), outcome(() -> MemberDescriptor.field(owner, "f", "I").owner()));
                 eq(outcome(() -> previousOwner(owner)), outcome(() -> QuerySpec.builder(owner, MemberKind.FIELD).build().owner()));
             }
+            eq(outcome(() -> previousOwner(null)), outcome(() -> MemberDescriptor.field(null, "f", "I").owner()));
+            eq(outcome(() -> previousOwner(null)), outcome(() -> QuerySpec.builder((String) null, MemberKind.FIELD).build().owner()));
             Method run = lambda.getClass().getDeclaredMethod("run");
             eq(previousOwner(hidden), MemberDescriptor.from(run).owner()); eq(MemberDescriptor.from(run), new MethodSchema(run).descriptor());
         });
@@ -1375,11 +1668,11 @@ public final class CoreContractTest {
         Path root = Path.of("").toAbsolutePath(); while (!Files.isDirectory(root.resolve("test-fixtures/isolated-src"))) { root = root.getParent(); if (root == null) throw new IOException("test-fixtures not found"); }
         fixtures = Files.createDirectories(root.resolve("ref-core/build/isolated-fixtures/all")); missing = Files.createDirectories(root.resolve("ref-core/build/isolated-fixtures/missing/fixture")).getParent();
         Path sources = root.resolve("test-fixtures/isolated-src/fixture");
-        int result = ToolProvider.getSystemJavaCompiler().run(null,System.out,System.err,"--release","17","-d",fixtures.toString(),sources.resolve("LoaderFixture.java").toString(),sources.resolve("MissingType.java").toString(),sources.resolve("MissingSignatureFixture.java").toString(),sources.resolve("ShadowParam.java").toString(),sources.resolve("ShadowOwner.java").toString());
+        int result = ToolProvider.getSystemJavaCompiler().run(null,System.out,System.err,"--release","17","-d",fixtures.toString(),sources.resolve("LoaderFixture.java").toString(),sources.resolve("MissingType.java").toString(),sources.resolve("MissingSignatureFixture.java").toString(),sources.resolve("ShadowParam.java").toString(),sources.resolve("ShadowOwner.java").toString(),sources.resolve("ShadowPeer.java").toString());
         if (result != 0) throw new IOException("fixture compilation failed: " + result);
         Files.copy(fixtures.resolve("fixture/MissingSignatureFixture.class"), missing.resolve("fixture/MissingSignatureFixture.class"), StandardCopyOption.REPLACE_EXISTING);
         Path completeJar = root.resolve("ref-core/build/isolated-fixtures/complete-fixture.jar");
-        fixtureJar(completeJar, fixtures, "fixture/LoaderFixture.class", "fixture/MissingType.class", "fixture/MissingSignatureFixture.class", "fixture/ShadowParam.class", "fixture/ShadowOwner.class");
+        fixtureJar(completeJar, fixtures, "fixture/LoaderFixture.class", "fixture/MissingType.class", "fixture/MissingSignatureFixture.class", "fixture/ShadowParam.class", "fixture/ShadowOwner.class", "fixture/ShadowPeer.class");
         Path missingJar = root.resolve("ref-core/build/isolated-fixtures/missing-signature-fixture.jar");
         fixtureJar(missingJar, missing, "fixture/MissingSignatureFixture.class");
         fixtures = completeJar; missing = missingJar;
@@ -1390,6 +1683,31 @@ public final class CoreContractTest {
         }
     }
     private static URLClassLoader isolated(Path directory) throws MalformedURLException { return new URLClassLoader(new URL[]{directory.toUri().toURL()}, null); }
+    /** Defines the named fixture classes itself and delegates every other name to its parent. */
+    private static class ChildFirstLoader extends URLClassLoader {
+        private final Set<String> local;
+        ChildFirstLoader(URL location, ClassLoader parent, String... local) { super(new URL[]{location}, parent); this.local = new HashSet<>(Arrays.asList(local)); }
+        @Override protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            synchronized (getClassLoadingLock(name)) {
+                if (!local.contains(name)) return super.loadClass(name, resolve);
+                Class<?> type = findLoadedClass(name); if (type == null) type = findClass(name);
+                if (resolve) resolveClass(type); return type;
+            }
+        }
+    }
+    /** Child-first for ShadowPeer; the first lookup of the flaky name fails, later ones delegate to the parent. */
+    private static final class FlakyLoader extends ChildFirstLoader {
+        private final String flaky; final AtomicInteger failures = new AtomicInteger();
+        FlakyLoader(URL location, ClassLoader parent, String flaky) { super(location, parent, "fixture.ShadowPeer"); this.flaky = flaky; }
+        @Override protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            if (name.equals(flaky) && failures.compareAndSet(0, 1)) throw new ClassNotFoundException(name + " (first lookup fails)");
+            return super.loadClass(name, resolve);
+        }
+    }
+    private static Map<?, ?> loadedTypes(CodeScope scope) throws ReflectiveOperationException {
+        Object resolver = field(CodeScope.class, "resolver").get(scope); if (resolver == null) return null;
+        synchronized (resolver) { Map<?, ?> loaded = (Map<?, ?>) field(ReflectionResolver.class, "loaded").get(resolver); return loaded == null ? null : new IdentityHashMap<>(loaded); }
+    }
     private static final class ShadowLoader extends URLClassLoader {
         private final boolean childOwner;
         ShadowLoader(URL location, ClassLoader parent, boolean childOwner) { super(new URL[]{location}, parent); this.childOwner = childOwner; }
