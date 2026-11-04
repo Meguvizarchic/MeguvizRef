@@ -42,6 +42,12 @@ public final class Fixture {
         } catch (ReflectiveOperationException e) { throw new IllegalStateException(e); }
     }
 
+    /** White-box: runs the scope's inflation step (what a failed base CAS does), racing the other actors. */
+    void inflate() {
+        try { INFLATE.invoke(scope); }
+        catch (ReflectiveOperationException e) { throw new IllegalStateException(e); }
+    }
+
     /** 1 when admitted, 0 when rejected with the scope's stale message. */
     int call() {
         ADMITTED.set(false);

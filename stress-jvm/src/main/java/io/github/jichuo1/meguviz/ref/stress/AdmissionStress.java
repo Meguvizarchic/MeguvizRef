@@ -56,6 +56,23 @@ public final class AdmissionStress {
     }
 
     /**
+     * Inflation itself races a caller and close on a scope that starts with the single base word: r1 caller, r2
+     * provider closes, r3 violations. Inflation must be ordered against close (no cells after close, no cells that
+     * close missed) and must publish the cells before INFLATED, so the caller never sees INFLATED without a table.
+     */
+    @JCStressTest
+    @Outcome(id = {"0, 1, 0", "1, 1, 0"}, expect = ACCEPTABLE, desc = "The caller is admitted before close or rejected after it; providers close once, after the drain.")
+    @Outcome(expect = FORBIDDEN, desc = "Provider closed zero or several times, early, or by a rejected caller.")
+    @State
+    public static class InflateWhileCallingAndClosing {
+        final Fixture f = new Fixture(false);
+        @Actor public void inflater() { f.inflate(); }
+        @Actor public void caller(III_Result r) { r.r1 = f.call(); }
+        @Actor public void closer() { f.close(); }
+        @Arbiter public void arbiter(III_Result r) { r.r2 = f.closes.get(); r.r3 = f.violations.get(); }
+    }
+
+    /**
      * Two closers race one caller on an inflated scope: r1 caller, r2 provider closes, r3 violations.
      */
     @JCStressTest
