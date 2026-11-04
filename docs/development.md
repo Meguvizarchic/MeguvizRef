@@ -22,9 +22,15 @@ bash gradlew -Pmeguviz.profile=android packageRelease --build-cache --no-daemon
 
 # 主机 JMH 微基准（默认不纳入构建，不发布，不属于 verifyHost）
 bash gradlew -Pmeguviz.benchmarks=true :benchmark-jvm:jmh -Pjmh.include=InvokeBenchmark "-Pjmh.args=-f 2 -wi 3 -i 5 -w 1s -r 1s -prof gc"
+
+# jcstress 并发测试（同样默认不纳入构建；单一 JVM 配置约 1.5 分钟）
+bash gradlew -Pmeguviz.jcstress=true :stress-jvm:jcstress "-Pjcstress.args=-m quick -jvmArgs -Xmx1g -sc false"
+
+# 准入/关闭协议与无锁视图的变异检查（每个错误变体都应失败）
+python3 tools/mutation_check.py
 ```
 
-基准结果只代表主机 JDK，说明与历史数据见[性能说明](performance.md)。
+基准与 jcstress 结果只代表主机 JDK，说明与历史数据见[性能说明](performance.md)。
 
 Windows 使用 `gradlew.bat` 替换 `bash gradlew`；PowerShell 中带点号的 `-P` 参数应整体加引号，例如 `'-Pmeguviz.profile=android'`。
 
