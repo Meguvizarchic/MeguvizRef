@@ -58,8 +58,16 @@ public class ResolveBenchmark {
     public ResolutionResult exactHit() { return shared.resolve(exact); }
 
     @Benchmark
+    @Threads(2)
+    public ResolutionResult exactHitThreads2() { return shared.resolve(exact); }
+
+    @Benchmark
     @Threads(4)
     public ResolutionResult exactHitThreads4() { return shared.resolve(exact); }
+
+    @Benchmark
+    @Threads(8)
+    public ResolutionResult exactHitThreads8() { return shared.resolve(exact); }
 
     @Benchmark
     public ResolutionResult structuralHit() { return shared.resolve(structural); }
