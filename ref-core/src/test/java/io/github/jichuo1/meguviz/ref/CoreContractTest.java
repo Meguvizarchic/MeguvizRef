@@ -334,11 +334,27 @@ public final class CoreContractTest {
                     eq(ResolutionStatus.UNAVAILABLE, first.status()); eq("owner_type_unavailable", first.receipt().reason()); eq(1, flaky.failures.get());
                     eq(ResolutionStatus.RESOLVED, scope.resolve(QuerySpec.exact(peerMethod)).status()); // the failure was not cached
                 }
-                try (CodeScope small = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 3)) {
-                    for (Method method : String.class.getDeclaredMethods()) if (Modifier.isPublic(method.getModifiers())) small.resolveRaw(QuerySpec.exact(MemberDescriptor.from(method)));
-                    int entries = 0; for (Object names : loadedTypes(small).values()) entries += ((Map<?, ?>) names).size();
-                    eq(3, entries);
+            }
+            // The same failure on the cached path: an unrelated first lookup makes the failing one the resolver's second.
+            try (URLClassLoader parent = isolated(fixtures); FlakyLoader flaky = new FlakyLoader(fixtures.toUri().toURL(), parent, "fixture.ShadowParam")) {
+                MemberDescriptor peerMethod = MemberDescriptor.method("fixture.ShadowPeer", "method", "Lfixture/ShadowParam;", "Lfixture/ShadowParam;");
+                Class<?> parentParam = Class.forName("fixture.ShadowParam", false, parent);
+                try (CodeScope scope = CodeScope.open(flaky)) {
+                    eq(ResolutionStatus.RESOLVED, scope.resolveRaw(QuerySpec.exact(MemberDescriptor.method("java.lang.String", "length", "I"))).status());
+                    eq(null, loadedTypes(scope)); eq(0, flaky.failures.get());
+                    ResolutionResult failed = scope.resolve(QuerySpec.exact(peerMethod));
+                    eq(ResolutionStatus.UNAVAILABLE, failed.status()); eq("owner_type_unavailable", failed.receipt().reason()); eq(1, flaky.failures.get());
+                    Map<?, ?> names = (Map<?, ?>) loadedTypes(scope).get(flaky);
+                    check(names.containsKey("fixture.ShadowPeer") && !names.containsKey("Lfixture/ShadowParam;"), "only the successful owner lookup is cached: " + names.keySet());
+                    RawResolution resolved = scope.resolveRaw(QuerySpec.exact(peerMethod));
+                    eq(ResolutionStatus.RESOLVED, resolved.status()); eq(parentParam, ((Method) resolved.members().get(0)).getParameterTypes()[0]);
+                    eq(parentParam, ((Map<?, ?>) loadedTypes(scope).get(flaky)).get("Lfixture/ShadowParam;"));
                 }
+            }
+            try (CodeScope small = CodeScope.open(LOADER, AccessPolicy.PRESERVE_JAVA_ACCESS, 3)) {
+                for (Method method : String.class.getDeclaredMethods()) if (Modifier.isPublic(method.getModifiers())) small.resolveRaw(QuerySpec.exact(MemberDescriptor.from(method)));
+                int entries = 0; for (Object names : loadedTypes(small).values()) entries += ((Map<?, ?>) names).size();
+                eq(3, entries);
             }
         });
         test("loader-shadow-exact-provider-and-structural-use-owner-signature-identity", () -> {

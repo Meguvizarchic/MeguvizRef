@@ -74,6 +74,11 @@ MUTATIONS = [
     ("type-cache-ignores-loader-put", "(companion edit of type-cache-ignores-loader)",
      "Map<String, Class<?>> names = loaded.get(loader);\n        if (names == null) loaded.put(loader, names = new HashMap<>());",
      "Map<String, Class<?>> names = loaded.get(null);\n        if (names == null) loaded.put(null, names = new HashMap<>());", RESOLVER),
+    ("type-cache-negative", "the type cache remembers failed type lookups (negative caching)",
+     "if (type == null) { type = descriptor.resolve(loader); rememberType(loader, value, type); }",
+     "if (type == Void.class) throw new ClassNotFoundException(value);\n"
+     "        if (type == null) { try { type = descriptor.resolve(loader); } catch (ClassNotFoundException e) { rememberType(loader, value, Void.class); throw e; } rememberType(loader, value, type); }",
+     RESOLVER),
     ("type-cache-unbounded", "the type cache ignores the scope capacity",
      "        if (loadedTypes >= schemaCapacity) return;\n", "", RESOLVER),
     ("table-memo-survives-clear", "clear keeps the member-table memo",
