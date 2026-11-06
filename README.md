@@ -1,21 +1,39 @@
 <div align="center">
 
+<img src="docs/brand/MeguvizRef.svg" width="96" height="96" alt="MeguvizRef">
+
 # MeguvizRef
 
 **面向 Java 17 与 Android 的反射工具库**
 
 成员解析 · 作用域生命周期 · 不持有接收对象的调用计划
 
+<br>
+
+[![License](https://img.shields.io/badge/license-Apache--2.0-00AEEC?style=flat-square&labelColor=2d3a55)](LICENSE)
+[![Language](https://img.shields.io/badge/lang-Java-DEA584?style=flat-square&labelColor=2d3a55)](https://github.com/Meguvizarchic/MeguvizRef)
+[![Issues](https://img.shields.io/github/issues/Meguvizarchic/MeguvizRef?style=flat-square&labelColor=2d3a55)](https://github.com/Meguvizarchic/MeguvizRef/issues)
 [![CI](https://github.com/jichuo1/MeguvizRef/actions/workflows/ci.yml/badge.svg)](https://github.com/jichuo1/MeguvizRef/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/jichuo1/MeguvizRef)](https://github.com/jichuo1/MeguvizRef/releases)
-[![JitPack](https://jitpack.io/v/jichuo1/MeguvizRef.svg)](https://jitpack.io/#jichuo1/MeguvizRef)
-![Java 17+](https://img.shields.io/badge/Java-17%2B-orange)
-![Android API 27+](https://img.shields.io/badge/Android-API%2027%2B-3DDC84)
-[![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE)
 
-[快速开始](#快速开始) · [使用示例](#使用示例) · [关键行为](#关键行为) · [文档](#文档)
+[✨ 特性](#-特性) · [📦 模块](#-模块) · [🚀 快速开始](#-快速开始) · [💡 使用示例](#-使用示例) · [⚠️ 关键行为](#-关键行为) · [📚 文档](#-文档) · [📄 许可证](#-许可证)
 
 </div>
+
+---
+
+<details>
+<summary><b>目录</b></summary>
+
+- [✨ 特性](#-特性)
+- [📦 模块](#-模块)
+- [🚀 快速开始](#-快速开始)
+- [💡 使用示例](#-使用示例)
+- [⚠️ 关键行为](#-关键行为)
+- [📚 文档](#-文档)
+- [📄 许可证](#-许可证)
+
+</details>
 
 ---
 
