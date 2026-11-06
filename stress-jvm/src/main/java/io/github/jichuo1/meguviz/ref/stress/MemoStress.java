@@ -15,7 +15,7 @@ import org.openjdk.jcstress.annotations.*;
 import org.openjdk.jcstress.infra.results.II_Result;
 import org.openjdk.jcstress.infra.results.I_Result;
 
-/** The lock-free most-recent cache-hit memo of CodeScope.resolve (MeguvizRef 1.1.0 round 1). */
+/** The lock-free most-recent cache-hit memo of CodeScope.resolve (MeguvizRef 1.2.0 round 1). */
 public final class MemoStress {
     private MemoStress() { }
     static final ClassLoader LOADER = MemoStress.class.getClassLoader();

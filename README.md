@@ -59,7 +59,7 @@ dependencies {
 
 ## 💡 使用示例
 
-**最短路径**（1.1.0 起，尚未发布）：按 `Class` 查询，一步绑定，可变参数调用。发布前可在本仓库执行 `bash gradlew publishLocal`，再从 `build/local-maven` 以 `1.1.0-SNAPSHOT` 试用。
+**最短路径**（1.2.0 起，尚未发布）：按 `Class` 查询，一步绑定，可变参数调用。发布前可在本仓库执行 `bash gradlew publishLocal`，再从 `build/local-maven` 以 `1.2.0-SNAPSHOT` 试用。
 
 ```java
 import io.github.jichuo1.meguviz.ref.api.query.QuerySpec;
@@ -111,7 +111,7 @@ try (CodeScope scope = CodeScope.open(String.class.getClassLoader())) {
 | [构建与验证](docs/development.md) | 本地构建、测试与验证流程 |
 | [性能说明](docs/performance.md) | 性能改动依据与主机基准（非设备数据） |
 | [1.0.0 发布说明](docs/releases/1.0.0.md) | 版本内容与变更 |
-| [1.1.0 发布说明草稿](docs/releases/1.1.0.md) | 未发布：新增 API、性能改动、行为说明与发布前检查 |
+| [1.2.0 发布说明草稿](docs/releases/1.2.0.md) | 未发布：新增 API、性能改动、行为说明与发布前检查 |
 
 ## 📄 许可证
 

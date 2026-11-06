@@ -72,7 +72,7 @@ public class InvokeBenchmark {
             threads[t].start();
         }
         for (Thread thread : threads) thread.join();
-        // Since 1.1.0 round 2 contention inflates per-thread admission cells; check that the setup reached that state.
+        // Since 1.2.0 round 2 contention inflates per-thread admission cells; check that the setup reached that state.
         try {
             java.lang.reflect.Field cells = CodeScope.class.getDeclaredField("cells");
             cells.setAccessible(true);

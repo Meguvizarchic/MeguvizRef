@@ -75,7 +75,7 @@ public class BatchResolveBenchmark {
         return total;
     }
 
-    /** resolveRaw in one scope (bridge install batch on the 1.1.0 API). */
+    /** resolveRaw in one scope (bridge install batch on the 1.2.0 API). */
     @Benchmark
     public int structuralOneScopeRaw() throws Exception {
         int total = 0;

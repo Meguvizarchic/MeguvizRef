@@ -1,6 +1,6 @@
-# 性能说明（1.1.0 开发版）
+# 性能说明（1.2.0 开发版）
 
-本页记录 1.1.0 开发周期两轮性能改动的依据、验证方法、主机测量结果和后续方向。所有数据来自主机 JDK 17 x86-64，**不是 ART 或设备上的证据**；Android 上的收益需要设备基准另行确认。
+本页记录 1.2.0 开发周期两轮性能改动的依据、验证方法、主机测量结果和后续方向。所有数据来自主机 JDK 17 x86-64，**不是 ART 或设备上的证据**；Android 上的收益需要设备基准另行确认。
 
 - 第 1 轮：计划调用无锁准入、作用域构造、结构查询成员表、描述符与缓存命中、`resolveRaw`/`isCurrent`。
 - 第 2 轮：多线程共享作用域时的分段准入、jcstress 与变异检查、未命中路径（single-flight、覆盖范围字符串、精确描述符类型缓存）和桥接安装批量。
@@ -22,7 +22,7 @@ bash gradlew -Pmeguviz.benchmarks=true :benchmark-jvm:jmh \
 | `InvokeBenchmark` | MethodPlan/FieldPlan/ConstructorPlan 与直接反射对比，含槽位号大于 127 的计划和 4 线程共享计划 |
 | `ResolveBenchmark` | 作用域打开关闭；精确/结构查询的缓存命中（含 4 线程）与全新作用域未命中；155 个方法的 owner 上同一作用域内 8 个不同查询；桥接式 ALL 查询加逐个 `exportRaw` |
 | `DescriptorBenchmark` | schema 快照、`MemberDescriptor.from`、描述符哈希、`summary()` 与桥接式查询构造 |
-| `RawResolveBenchmark` | 与桥接式导出对应的 `resolveRaw` 版本（1.1.0 新 API） |
+| `RawResolveBenchmark` | 与桥接式导出对应的 `resolveRaw` 版本（1.2.0 新 API） |
 | `BatchResolveBenchmark`（第 2 轮） | 桥接安装批量：`java.lang.String` 上 1 或 20 个不同名的描述符目标，每个目标构造一次桥接默认结构查询；一个作用域内 `resolve`+`exportRaw` 或 `resolveRaw`、每个目标一个作用域，以及完整精确描述符 |
 
 第 2 轮在 `InvokeBenchmark` 中增加了 2/8 线程共享计划、每线程独立作用域的 4 线程参照和"已出现过竞争的作用域上的单线程调用"，在 `ResolveBenchmark` 中增加了引用类型参数的精确未命中，在 `DescriptorBenchmark` 中增加了单个引用类型的解析。
@@ -275,7 +275,7 @@ MeguvizHook 桥接计划用一个作用域解析同一 owner 上的多个描述�
 ## 后续方向
 
 1. 在 ART 设备上验证分段准入、成员表与类型缓存（`samples/android-consumer`），补充设备证据；手机大小核的缓存行为与 x86 SMT 不同。
-2. MeguvizHook 桥接在 1.1.0 发布后：安装批量共用一个作用域并改用 `resolveRaw`（不累计 binding），会话的身份检查改用一次加锁的 `isCurrent`。
+2. MeguvizHook 桥接在 1.2.0 发布后：安装批量共用一个作用域并改用 `resolveRaw`（不累计 binding），会话的身份检查改用一次加锁的 `isCurrent`。
 3. 回执与结果的内部免复制构造需要跨包 API，若将来调整包结构可再评估。
 4. jcstress 目前只在 x86 主机上运行；如有 ARM 主机，补跑一次完整组合。
 
