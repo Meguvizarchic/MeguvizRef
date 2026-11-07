@@ -4,11 +4,32 @@ tasks.withType<JavaCompile>().configureEach { options.release.set(17); options.e
 tasks.withType<Jar>().configureEach { isPreserveFileTimestamps = false; isReproducibleFileOrder = true }
 dependencyLocking { lockAllConfigurations() }
 tasks.register<JavaExec>("contractTests") {
-    dependsOn(tasks.testClasses)
+    dependsOn(tasks.testClasses, "querySpecHashContractTests", "providerDomainContractTests", "loaderSecurityContractTests")
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass.set("io.github.jichuo1.meguviz.ref.CoreContractTest")
     javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(17)) })
     args(layout.buildDirectory.file("test-results/contracts/TEST-core.xml").get().asFile.absolutePath)
+    workingDir = rootProject.projectDir
+}
+tasks.register<JavaExec>("querySpecHashContractTests") {
+    dependsOn(tasks.testClasses)
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("io.github.jichuo1.meguviz.ref.QuerySpecHashContractTest")
+    javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(17)) })
+}
+tasks.register<JavaExec>("providerDomainContractTests") {
+    dependsOn(tasks.testClasses)
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("io.github.jichuo1.meguviz.ref.ProviderDomainContractTest")
+    javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(17)) })
+    workingDir = rootProject.projectDir
+}
+tasks.register<JavaExec>("loaderSecurityContractTests") {
+    dependsOn(tasks.testClasses)
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("io.github.jichuo1.meguviz.ref.LoaderSecurityContractTest")
+    javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(17)) })
+    jvmArgs("-Djava.security.manager=allow")
     workingDir = rootProject.projectDir
 }
 tasks.check { dependsOn("contractTests") }

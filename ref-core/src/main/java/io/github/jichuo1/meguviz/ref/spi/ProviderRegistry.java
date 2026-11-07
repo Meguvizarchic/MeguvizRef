@@ -48,11 +48,20 @@ public final class ProviderRegistry implements AutoCloseable {
         Map<String, CandidateProvider> previous;
         synchronized (this) { previous = providers; providers = null; }
         if (previous == null) return;
-        RuntimeException failure = null;
+        Throwable failure = null;
+        boolean interrupted = Thread.currentThread().isInterrupted();
         for (int i = order.size() - 1; i >= 0; i--) {
             try { previous.get(order.get(i)).close(); }
-            catch (RuntimeException e) { if (failure == null) failure = e; else failure.addSuppressed(e); }
+            catch (Throwable e) {
+                if (e instanceof Error) throw (Error) e;
+                if (e instanceof InterruptedException) interrupted = true;
+                if (failure == null) failure = e; else if (failure != e) failure.addSuppressed(e);
+            } finally {
+                interrupted |= Thread.currentThread().isInterrupted();
+                if (interrupted) Thread.currentThread().interrupt();
+            }
         }
-        if (failure != null) throw failure;
+        if (failure != null) throw rethrow(failure);
     }
+    @SuppressWarnings("unchecked") private static <T extends Throwable> RuntimeException rethrow(Throwable failure) throws T { throw (T) failure; }
 }

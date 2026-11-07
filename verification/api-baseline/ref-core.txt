@@ -58,6 +58,7 @@ Compiled from "ResolutionReceipt.java"
 public final class io.github.jichuo1.meguviz.ref.api.evidence.ResolutionReceipt {
   public static final int SCHEMA_MAJOR;
   public io.github.jichuo1.meguviz.ref.api.evidence.ResolutionReceipt(java.lang.String, io.github.jichuo1.meguviz.ref.api.query.Selection, io.github.jichuo1.meguviz.ref.api.result.ResolutionStatus, io.github.jichuo1.meguviz.ref.api.result.Coverage, java.util.List<io.github.jichuo1.meguviz.ref.api.descriptor.MemberDescriptor>, java.lang.String, java.lang.String);
+  public io.github.jichuo1.meguviz.ref.api.evidence.ResolutionReceipt(java.lang.String, io.github.jichuo1.meguviz.ref.api.query.Selection, io.github.jichuo1.meguviz.ref.api.result.ResolutionStatus, io.github.jichuo1.meguviz.ref.api.result.Coverage, java.util.List<io.github.jichuo1.meguviz.ref.api.descriptor.MemberDescriptor>, java.lang.String, java.lang.String, io.github.jichuo1.meguviz.ref.api.evidence.ResolutionReceipt$InterruptionOrigin);
   public java.lang.String querySummary();
   public io.github.jichuo1.meguviz.ref.api.query.Selection selection();
   public io.github.jichuo1.meguviz.ref.api.result.ResolutionStatus status();
@@ -65,6 +66,14 @@ public final class io.github.jichuo1.meguviz.ref.api.evidence.ResolutionReceipt 
   public java.util.List<io.github.jichuo1.meguviz.ref.api.descriptor.MemberDescriptor> descriptors();
   public java.lang.String reason();
   public java.lang.String causeType();
+  public io.github.jichuo1.meguviz.ref.api.evidence.ResolutionReceipt$InterruptionOrigin interruptionOrigin();
+}
+Compiled from "ResolutionReceipt.java"
+public final class io.github.jichuo1.meguviz.ref.api.evidence.ResolutionReceipt$InterruptionOrigin extends java.lang.Enum<io.github.jichuo1.meguviz.ref.api.evidence.ResolutionReceipt$InterruptionOrigin> {
+  public static final io.github.jichuo1.meguviz.ref.api.evidence.ResolutionReceipt$InterruptionOrigin UNKNOWN;
+  public static final io.github.jichuo1.meguviz.ref.api.evidence.ResolutionReceipt$InterruptionOrigin SINGLE_FLIGHT_WAITER;
+  public static io.github.jichuo1.meguviz.ref.api.evidence.ResolutionReceipt$InterruptionOrigin[] values();
+  public static io.github.jichuo1.meguviz.ref.api.evidence.ResolutionReceipt$InterruptionOrigin valueOf(java.lang.String);
 }
 Compiled from "AccessPolicy.java"
 public final class io.github.jichuo1.meguviz.ref.api.query.AccessPolicy extends java.lang.Enum<io.github.jichuo1.meguviz.ref.api.query.AccessPolicy> {
@@ -226,6 +235,7 @@ Compiled from "QueryCoordinator.java"
 public final class io.github.jichuo1.meguviz.ref.runtime.resolve.QueryCoordinator<K, V> {
   public io.github.jichuo1.meguviz.ref.runtime.resolve.QueryCoordinator(int);
   public V execute(K, java.util.function.Supplier<V>, long) throws java.lang.InterruptedException, java.util.concurrent.TimeoutException;
+  public V execute(K, java.util.function.Supplier<V>, long, java.util.function.Function<java.lang.InterruptedException, V>) throws java.lang.InterruptedException, java.util.concurrent.TimeoutException;
   public synchronized void close();
 }
 Compiled from "ReflectionResolver.java"

@@ -3,6 +3,7 @@ package io.github.jichuo1.meguviz.ref.runtime.resolve;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.Supplier;
+import java.util.function.Function;
 
 /** Bounded synchronous single-flight. User work runs outside this monitor; waiters never cancel owners. */
 public final class QueryCoordinator<K, V> {
@@ -12,6 +13,10 @@ public final class QueryCoordinator<K, V> {
     private boolean closed;
     public QueryCoordinator(int capacity) { if (capacity < 1) throw new IllegalArgumentException("capacity"); this.capacity = capacity; }
     public V execute(K key, Supplier<V> work, long timeoutMillis) throws InterruptedException, TimeoutException {
+        return execute(key, work, timeoutMillis, null);
+    }
+    /** The handler runs only when this caller's wait is interrupted, never for owner work. */
+    public V execute(K key, Supplier<V> work, long timeoutMillis, Function<InterruptedException, V> waiterInterrupted) throws InterruptedException, TimeoutException {
         Flight<V> flight; boolean owner;
         Thread current = Thread.currentThread();
         synchronized (this) {
@@ -36,6 +41,10 @@ public final class QueryCoordinator<K, V> {
             finally { synchronized (this) { if (flights.get(key) == flight) flights.remove(key); } }
         }
         try { return flight.future.get(timeoutMillis, TimeUnit.MILLISECONDS); }
+        catch (InterruptedException interrupted) {
+            if (waiterInterrupted == null) throw interrupted;
+            return waiterInterrupted.apply(interrupted);
+        }
         catch (ExecutionException failure) {
             Throwable cause = failure.getCause();
             if (cause instanceof RuntimeException) throw (RuntimeException) cause;

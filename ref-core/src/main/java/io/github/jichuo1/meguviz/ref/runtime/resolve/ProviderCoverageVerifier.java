@@ -7,31 +7,36 @@ import java.util.*;
 
 /** Independent cold-path visible-domain replay. A provider's complete flag alone is never a uniqueness proof. */
 final class ProviderCoverageVerifier {
-    static boolean verifies(QuerySpec query, Class<?> owner, Set<Member> provided) {
+    static Verification verify(QuerySpec query, Class<?> owner, Set<Member> provided) {
         Set<Member> expected = new HashSet<>();
+        Member first = null;
         Class<?>[] requiredParameters = query.parameterClasses(), argumentTypes = query.argumentClasses();
         int depth = 0, inspected = 0;
         try {
             for (Class<?> current = owner; current != null; current = current.getSuperclass()) {
-                if (++depth > query.depthLimit()) return false;
+                if (++depth > query.depthLimit()) return null;
                 boolean javaPublic = query.hierarchy() == Hierarchy.JAVA_PUBLIC;
                 Member[] domain;
                 if (query.kind() == MemberKind.METHOD) domain = javaPublic ? current.getMethods() : current.getDeclaredMethods();
                 else if (query.kind() == MemberKind.FIELD) domain = javaPublic ? current.getFields() : current.getDeclaredFields();
                 else domain = current.getDeclaredConstructors();
                 for (Member member : domain) {
-                    if (Thread.currentThread().isInterrupted() || ++inspected > query.candidateBudget()) return false;
+                    if (Thread.currentThread().isInterrupted() || ++inspected > query.candidateBudget()) return null;
                     String name = member instanceof Constructor<?> ? "<init>" : member.getName();
                     if (query.name() != null && !query.name().equals(name)) continue;
                     if (query.staticOnly() != null && query.staticOnly() != Modifier.isStatic(member.getModifiers())) continue;
                     if (query.synthetic() != null && query.synthetic() != member.isSynthetic()) continue;
                     if (query.bridge() != null && query.bridge() != (member instanceof Method && ((Method) member).isBridge())) continue;
+                    if (query.parameterCount() >= 0) {
+                        int count = member instanceof Method ? ((Method) member).getParameterCount()
+                                : member instanceof Constructor<?> ? ((Constructor<?>) member).getParameterCount() : 0;
+                        if (count != query.parameterCount()) continue;
+                    }
                     Class<?>[] parameters;
                     Class<?> type;
                     if (member instanceof Method) { parameters = ((Method) member).getParameterTypes(); type = ((Method) member).getReturnType(); }
                     else if (member instanceof Constructor<?>) { parameters = ((Constructor<?>) member).getParameterTypes(); type = void.class; }
                     else { parameters = new Class<?>[0]; type = ((Field) member).getType(); }
-                    if (query.parameterCount() >= 0 && parameters.length != query.parameterCount()) continue;
                     if (requiredParameters != null && !Arrays.equals(parameters, requiredParameters)) continue;
                     if (query.returnClass() != null && type != query.returnClass()) continue;
                     if (argumentTypes != null) {
@@ -41,11 +46,15 @@ final class ProviderCoverageVerifier {
                         if (!compatible) continue;
                     }
                     if (query.exactDescriptor() != null && !query.exactDescriptor().equals(MemberDescriptor.from(member))) continue;
-                    expected.add(member);
+                    if (expected.add(member) && first == null) first = member;
                 }
                 if (query.hierarchy() != Hierarchy.SUPERCLASSES) break;
             }
-        } catch (LinkageError | SecurityException failure) { return false; }
-        return expected.equals(provided);
+        } catch (LinkageError | SecurityException failure) { return null; }
+        return expected.equals(provided) ? new Verification(first) : null;
+    }
+    static final class Verification {
+        final Member first;
+        Verification(Member first) { this.first = first; }
     }
 }

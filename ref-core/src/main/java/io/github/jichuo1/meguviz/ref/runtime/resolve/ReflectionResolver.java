@@ -42,11 +42,21 @@ public final class ReflectionResolver {
         catch (LinkageError e) { return failure(ResolutionStatus.PARTIAL, query, "signature_linkage_failure", e); }
         catch (SecurityException e) { return failure(ResolutionStatus.ACCESS_DENIED, query, "query_access_denied", e); }
     }
-    private Outcome exact(QuerySpec query, Class<?> owner, ClassLoader loader) throws ClassNotFoundException {
+    private Outcome exact(QuerySpec query, Class<?> owner, ClassLoader scopeLoader) throws ClassNotFoundException {
         MemberDescriptor d = query.exactDescriptor();
+        ClassLoader loader;
+        try { loader = owner.getClassLoader(); }
+        catch (SecurityException denied) { loader = scopeLoader; }
         Class<?>[] parameters = new Class<?>[d.parameters().size()];
-        for (int i = 0; i < parameters.length; i++) parameters[i] = d.parameters().get(i).resolve(loader);
-        Class<?> type = d.type().resolve(loader);
+        Class<?> type;
+        try {
+            for (int i = 0; i < parameters.length; i++) parameters[i] = d.parameters().get(i).resolve(loader);
+            type = d.type().resolve(loader);
+        } catch (SecurityException denied) {
+            if (loader == scopeLoader) throw denied;
+            for (int i = 0; i < parameters.length; i++) parameters[i] = d.parameters().get(i).resolve(scopeLoader);
+            type = d.type().resolve(scopeLoader);
+        }
         try {
             Member member;
             if (d.kind() == MemberKind.METHOD) {
@@ -103,6 +113,7 @@ public final class ReflectionResolver {
             }
             if (query.hierarchy() != Hierarchy.SUPERCLASSES) break;
         }
+        if (Thread.currentThread().isInterrupted()) return outcome(ResolutionStatus.CANCELLED, query, matches, false, inspected, "interrupted", null);
         return select(query, matches, complete, inspected, reason, cause);
     }
     private Member[] members(Class<?> owner, QuerySpec query) {
@@ -139,8 +150,12 @@ public final class ReflectionResolver {
         catch (InterruptedException e) { Thread.currentThread().interrupt(); return failure(ResolutionStatus.CANCELLED, query, "provider_interrupted", e); }
         catch (java.util.concurrent.CancellationException e) { return failure(ResolutionStatus.CANCELLED, query, "provider_cancelled", e); }
         catch (Exception e) { return failure(ResolutionStatus.PARTIAL, query, "provider_failed", e); }
+        if (Thread.currentThread().isInterrupted()) return failure(ResolutionStatus.CANCELLED, query, "interrupted", null);
         if (!fingerprint.equals(batch.codeFingerprint())) return failure(ResolutionStatus.STALE, query, "provider_code_identity_mismatch", null);
         List<Entry> matches = new ArrayList<>(); Set<Member> seen = new HashSet<>();
+        Set<Member> publicDomain = query.hierarchy() == Hierarchy.JAVA_PUBLIC && !batch.candidates().isEmpty()
+                ? new HashSet<>(Arrays.asList(members(owner, query))) : null;
+        Map<String, Map<MemberDescriptor, Member>> publicIndexes = publicDomain == null ? null : new HashMap<>();
         int inspected = 0; boolean complete = batch.complete(); String reason = complete ? "provider_claim_runtime_verified" : "provider_partial"; Throwable cause = null;
         Class<?>[] parameters = query.parameterClasses(), arguments = query.argumentClasses();
         for (MemberDescriptor descriptor : batch.candidates()) {
@@ -148,25 +163,80 @@ public final class ReflectionResolver {
             if (inspected >= query.candidateBudget()) { complete = false; reason = "candidate_budget"; break; }
             inspected++; candidateChecks.incrementAndGet();
             Outcome verified = resolve(QuerySpec.exact(descriptor), loader, null, null);
-            if (verified.status != ResolutionStatus.RESOLVED) { complete = false; reason = "provider_candidate_unavailable"; continue; }
-            Entry entry = verified.entries.get(0);
-            if (!inDomain(owner, entry.member.getDeclaringClass(), query) || (query.hierarchy() == Hierarchy.JAVA_PUBLIC && !Modifier.isPublic(entry.member.getModifiers()))) { complete = false; reason = "provider_candidate_outside_domain"; continue; }
+            Entry entry = verified.status == ResolutionStatus.RESOLVED ? verified.entries.get(0) : null;
+            boolean inDomain = entry != null && inDomain(owner, entry.member.getDeclaringClass(), query)
+                    && (publicDomain == null || Modifier.isPublic(entry.member.getModifiers()));
+            if (!inDomain || (descriptor.kind() == query.kind() && publicDomain != null && !publicDomain.contains(entry.member))) {
+                Entry actual = domainEntry(query, owner, loader, descriptor, publicDomain, publicIndexes);
+                if (actual == null) { complete = false; reason = entry == null ? "provider_candidate_unavailable" : "provider_candidate_outside_domain"; continue; }
+                entry = actual;
+            }
             if (descriptor.kind() != query.kind() || !seen.add(entry.member)) continue;
             if (query.exactDescriptor() != null && !query.exactDescriptor().equals(descriptor)) continue;
             if (!cheapMatches(entry.member, query)) continue;
             MethodSchema schema = schema(entry.member);
             if (matches(schema, query, parameters, arguments)) matches.add(entry);
-            if (query.selection() == Selection.UNIQUE && matches.size() >= 2) break;
+            if (query.selection() == Selection.UNIQUE && matches.size() >= 2) {
+                if (complete) reason = "multiple_matches";
+                complete = false;
+                break;
+            }
             if (matches.size() >= query.resultLimit()) { complete = false; reason = "result_limit"; break; }
         }
         if (complete && !(query.selection() == Selection.UNIQUE && matches.size() > 1)) {
             Set<Member> provided = new HashSet<>();
             for (Entry match : matches) provided.add(match.member);
-            complete = ProviderCoverageVerifier.verifies(query, owner, provided);
+            ProviderCoverageVerifier.Verification verification = ProviderCoverageVerifier.verify(query, owner, provided);
+            complete = verification != null;
             reason = complete ? "provider_claim_independently_verified_java_query" : "provider_coverage_not_proven";
+            if (complete && query.selection() == Selection.FIRST && verification.first != null) {
+                for (int i = 0; i < matches.size(); i++) {
+                    if (matches.get(i).member.equals(verification.first)) { Collections.swap(matches, 0, i); break; }
+                }
+            }
         }
+        if (Thread.currentThread().isInterrupted()) return outcome(ResolutionStatus.CANCELLED, query, matches, false, inspected, "interrupted", null);
+        ProviderDescriptor providerDescriptor = provider.descriptor();
+        if (Thread.currentThread().isInterrupted()) return outcome(ResolutionStatus.CANCELLED, query, matches, false, inspected, "interrupted", null);
         Outcome result = select(query, matches, complete, inspected, reason, cause);
-        return new Outcome(result.status, result.entries, new Coverage("provider:" + provider.descriptor().id() + ":" + batch.universe(), result.coverage.complete(), inspected, reason), reason, result.cause);
+        return new Outcome(result.status, result.entries, new Coverage("provider:" + providerDescriptor.id() + ":" + batch.universe(), result.coverage.complete(), inspected, reason), reason, result.cause);
+    }
+    /** Resolve a shadowed declaring owner only within the actual requested domain. */
+    private Entry domainEntry(QuerySpec query, Class<?> owner, ClassLoader loader, MemberDescriptor descriptor,
+                              Set<Member> publicDomain, Map<String, Map<MemberDescriptor, Member>> publicIndexes) {
+        if (descriptor.kind() != query.kind()) return null;
+        if (publicDomain != null) {
+            if (Thread.currentThread().isInterrupted() || publicDomain.size() > query.candidateBudget()) return null;
+            Map<MemberDescriptor, Member> index = publicIndexes.get(descriptor.owner());
+            if (index == null) {
+                index = new HashMap<>();
+                for (Member member : publicDomain) {
+                    if (Thread.currentThread().isInterrupted()) return null;
+                    if (!member.getDeclaringClass().getName().equals(descriptor.owner())) continue;
+                    MemberDescriptor key = MemberDescriptor.from(member);
+                    if (!index.containsKey(key)) index.put(key, member);
+                    else if (!member.equals(index.get(key))) index.put(key, null);
+                }
+                publicIndexes.put(descriptor.owner(), index);
+            }
+            Member found = index.get(descriptor);
+            return found == null ? null : new Entry(found, descriptor);
+        }
+        Class<?> declaring = null; int depth = 0;
+        for (Class<?> current = owner; current != null && depth++ < query.depthLimit(); current = current.getSuperclass()) {
+            if (current.getName().equals(descriptor.owner())) {
+                if (declaring != null && declaring != current) return null;
+                declaring = current;
+            }
+            if (query.hierarchy() != Hierarchy.SUPERCLASSES) break;
+        }
+        if (declaring == null) return null;
+        QuerySpec exactQuery = QuerySpec.exact(descriptor);
+        lookups.incrementAndGet();
+        try {
+            Outcome verified = exact(exactQuery, declaring, loader);
+            return verified.status == ResolutionStatus.RESOLVED ? verified.entries.get(0) : null;
+        } catch (ClassNotFoundException | LinkageError | SecurityException failure) { return null; }
     }
     private boolean inDomain(Class<?> requested, Class<?> declaring, QuerySpec query) {
         if (query.hierarchy() == Hierarchy.JAVA_PUBLIC) return declaring.isAssignableFrom(requested);
