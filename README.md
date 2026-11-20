@@ -1,136 +1,56 @@
 <div align="center">
-
 <img src="docs/brand/MeguvizRef.svg" width="96" height="96" alt="MeguvizRef">
 
 # MeguvizRef
 
-**面向 Java 17 与 Android 的反射工具库**
+**面向 Java 17 与 Android 的反射查询和调用工具库**
 
-成员解析 · 作用域生命周期 · 不持有接收对象的调用计划
-
-<br>
-
-[![License](https://img.shields.io/badge/license-Apache--2.0-00AEEC?style=flat-square&labelColor=2d3a55)](LICENSE)
-[![Language](https://img.shields.io/badge/lang-Java-DEA584?style=flat-square&labelColor=2d3a55)](https://github.com/Meguvizarchic/MeguvizRef)
-[![Issues](https://img.shields.io/github/issues/Meguvizarchic/MeguvizRef?style=flat-square&labelColor=2d3a55)](https://github.com/Meguvizarchic/MeguvizRef/issues)
-[![CI](https://github.com/jichuo1/MeguvizRef/actions/workflows/ci.yml/badge.svg)](https://github.com/jichuo1/MeguvizRef/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/jichuo1/MeguvizRef)](https://github.com/jichuo1/MeguvizRef/releases)
-
-[✨ 特性](#-特性) · [📦 模块](#-模块) · [🚀 快速开始](#-快速开始) · [💡 使用示例](#-使用示例) · [⚠️ 关键行为](#-关键行为) · [📚 文档](#-文档) · [📄 许可证](#-许可证)
+[Maven Central](https://central.sonatype.com/artifact/io.github.jichuo1.meguviz/meguviz-ref-core) · [文档](docs/README.md) · [示例](samples)
 
 </div>
 
----
+MeguvizRef 可通过类、成员描述符或结构条件定位方法、字段与构造器。用 `CodeScope` 管理类加载器和缓存的生命周期，绑定后的调用计划可以复用，并在每次调用时传入接收对象。核心库只依赖 JDK。
 
-<details>
-<summary><b>目录</b></summary>
+## 快速开始
 
-- [✨ 特性](#-特性)
-- [📦 模块](#-模块)
-- [🚀 快速开始](#-快速开始)
-- [💡 使用示例](#-使用示例)
-- [⚠️ 关键行为](#-关键行为)
-- [📚 文档](#-文档)
-- [📄 许可证](#-许可证)
-
-</details>
-
----
-
-## ✨ 特性
-
-- **精确与结构查询**：基于描述符定位方法、字段和构造器，默认要求唯一匹配。
-- **作用域生命周期**：`CodeScope` 统一管理 loader 与缓存，关闭后拒绝新调用。
-- **无接收对象的调用计划**：计划与 receiver 解耦，调用时再传入。
-- **零第三方依赖**：核心模块只依赖 JDK。
-
-## 📦 模块
-
-| 模块 | 功能 | 运行时依赖 |
-|---|---|---|
-| `meguviz-ref-core` | 描述符、精确与结构查询、作用域、调用计划 | 无第三方依赖 |
-| `meguviz-ref-diagnostics` | 结构化诊断、代码身份、解析结果持久化 | core |
-| `meguviz-ref-android` | Android 平台与代码身份辅助功能 | core |
-
-## 🚀 快速开始
-
-**1. 添加仓库**（`settings.gradle.kts`）
+在 Gradle 的仓库配置中启用 `mavenCentral()`。
 
 ```kotlin
-dependencyResolutionManagement {
-    repositories {
-        mavenCentral()
+dependencies {
+    implementation("io.github.jichuo1.meguviz:meguviz-ref-core:1.2.0")
+}
+```
+
+```java
+import io.github.jichuo1.meguviz.ref.api.query.QuerySpec;
+import io.github.jichuo1.meguviz.ref.scope.CodeScope;
+
+public final class Example {
+    public static void main(String[] args) throws Throwable {
+        try (CodeScope scope = CodeScope.open(Example.class.getClassLoader())) {
+            var substring = scope.bindMethod(QuerySpec.method(String.class, "substring", int.class));
+            System.out.println(substring.call("hello", 2)); // llo
+        }
     }
 }
 ```
 
-**2. 引入依赖**（模块的 `build.gradle.kts`）
+结构查询默认要求唯一匹配。对公开成员遵循 Java 访问检查，访问非公开成员取决于平台权限。关闭作用域后会拒绝新的调用。
 
-```kotlin
-dependencies {
-    implementation("io.github.jichuo1.meguviz:meguviz-ref-core:1.0.0")
-}
-```
+## 按需选择模块
 
-> [!NOTE]
-> 已发布到 Maven Central。可选模块、Maven XML、GitHub 备用仓库与 JitPack 配置见[安装说明](docs/installation.md)。
+下表制品使用 groupId `io.github.jichuo1.meguviz`。
 
-## 💡 使用示例
+| 制品 | 用途 |
+| --- | --- |
+| `meguviz-ref-core` | 查询、调用计划和类加载器作用域 |
+| `meguviz-ref-diagnostics` | 结构化诊断与解析结果持久化 |
+| `meguviz-ref-android` | Android 平台适配和代码身份辅助 |
 
-**最短路径**（1.2.0 起，尚未发布）：按 `Class` 查询，一步绑定，可变参数调用。发布前可在本仓库执行 `bash gradlew publishLocal`，再从 `build/local-maven` 以 `1.2.0-SNAPSHOT` 试用。
+Android 模块需要 `compileSdk` 37 或更新版本，设备最低 API 27。
 
-```java
-import io.github.jichuo1.meguviz.ref.api.query.QuerySpec;
-import io.github.jichuo1.meguviz.ref.runtime.invoke.MethodPlan;
-import io.github.jichuo1.meguviz.ref.scope.CodeScope;
+## 文档
 
-try (CodeScope scope = CodeScope.open(String.class.getClassLoader())) {
-    MethodPlan substring = scope.bindMethod(QuerySpec.method(String.class, "substring", int.class));
-    Object value = substring.call("hello", 2); // "llo"
-}
-```
-
-查询默认要求唯一匹配，否则抛出带状态和原因的 `ResolutionException`。非公开成员使用 `CodeScope.open(loader, AccessPolicy.TRY_SUPPRESS_JAVA_CHECKS)`。
-
-**可移植精确描述符**（1.0.0 起）：
-
-```java
-import io.github.jichuo1.meguviz.ref.api.descriptor.MemberDescriptor;
-import io.github.jichuo1.meguviz.ref.api.query.QuerySpec;
-import io.github.jichuo1.meguviz.ref.api.result.ResolutionResult;
-import io.github.jichuo1.meguviz.ref.runtime.invoke.MethodPlan;
-import io.github.jichuo1.meguviz.ref.scope.CodeScope;
-
-MemberDescriptor descriptor = MemberDescriptor.method(
-    "java.lang.String", "substring", "Ljava/lang/String;", "I");
-try (CodeScope scope = CodeScope.open(String.class.getClassLoader())) {
-    ResolutionResult result = scope.resolve(QuerySpec.exact(descriptor));
-    MethodPlan plan = scope.bindMethod(result.requireSingle());
-    Object value = plan.invoke("hello", new Object[] {2}); // "llo"
-}
-```
-
-更多可编译示例：[Java](samples/jvm-consumer) · [Kotlin](samples/kotlin-consumer) · [Android](samples/android-consumer)
-
-## ⚠️ 关键行为
-
-- 结构查询默认要求唯一匹配；覆盖不完整或预算耗尽时不会报告唯一成功。
-- 作用域关闭后拒绝新调用，已经进入的目标方法可以完成。
-- 默认遵循 Java 访问检查；显式放宽可访问性仍可能被平台拒绝。
-- `exportRaw()` 返回的反射对象由调用方管理，关闭作用域无法撤销其外部引用。
-- 性能取决于查询方式、缓存命中率和运行环境，不承诺比直接反射更快。
-
-## 📚 文档
-
-| 文档 | 内容 |
-|---|---|
-| [文档目录](docs/README.md) | 全部文档入口 |
-| [核心 API](docs/api/core-contracts.md) | 核心合同与语义 |
-| [构建与验证](docs/development.md) | 本地构建、测试与验证流程 |
-| [性能说明](docs/performance.md) | 性能改动依据与主机基准（非设备数据） |
-| [1.0.0 发布说明](docs/releases/1.0.0.md) | 版本内容与变更 |
-| [1.2.0 发布说明草稿](docs/releases/1.2.0.md) | 未发布：新增 API、性能改动、行为说明与发布前检查 |
-
-## 📄 许可证
-
-本项目使用 [Apache License 2.0](LICENSE)，版权与第三方说明见 [NOTICE](NOTICE)。
+- [核心 API](docs/api/core-contracts.md) · [版本策略](docs/api/version-policy.md)
+- [Java 示例](samples/jvm-consumer) · [Kotlin 示例](samples/kotlin-consumer) · [Android 示例](samples/android-consumer)
+- [Apache License 2.0](LICENSE) · [版权与第三方声明](NOTICE)
