@@ -5,19 +5,20 @@
 
 **面向 Java 17 与 Android 的反射查询和调用工具库**
 
-[Maven Central](https://central.sonatype.com/artifact/io.github.jichuo1.meguviz/meguviz-ref-core) · [文档](docs/README.md) · [示例](samples)
+[Maven Central](https://central.sonatype.com/artifact/io.github.jichuo1.meguviz/meguviz-ref-core) · [文档](docs/README.md) · [AI Skill](.agents/skills/meguviz-ref/SKILL.md) · [示例](samples)
 
 </div>
 
-MeguvizRef 可通过类、成员描述符或结构条件定位方法、字段与构造器。用 `CodeScope` 管理类加载器和缓存的生命周期，绑定后的调用计划可以复用，并在每次调用时传入接收对象。核心库只依赖 JDK。
+MeguvizRef 可通过类、成员描述符或结构条件定位方法、字段与构造器。它使用 `CodeScope` 管理类加载器和缓存的生命周期，绑定后的调用计划可以复用，并在每次调用时传入接收对象。核心库只依赖 JDK。
 
 ## 快速开始
 
-在 Gradle 的仓库配置中启用 `mavenCentral()`。
+在 Gradle 的仓库配置中启用 `mavenCentral()`（可通过 `meguviz-bom:1.2.0` 统一管理版本）。
 
 ```kotlin
 dependencies {
-    implementation("io.github.jichuo1.meguviz:meguviz-ref-core:1.2.0")
+    implementation(platform("io.github.jichuo1.meguviz:meguviz-bom:1.2.0"))
+    implementation("io.github.jichuo1.meguviz:meguviz-ref-core")
 }
 ```
 
@@ -39,7 +40,7 @@ public final class Example {
 
 ## 按需选择模块
 
-下表制品使用 groupId `io.github.jichuo1.meguviz`。
+下表制品使用 groupId `io.github.jichuo1.meguviz`，当前发布版本为 `1.2.0`。
 
 | 制品 | 用途 |
 | --- | --- |
@@ -49,8 +50,9 @@ public final class Example {
 
 Android 模块需要 `compileSdk` 37 或更新版本，设备最低 API 27。
 
-## 文档
+## 文档与 AI 接入
 
-- [核心 API](docs/api/core-contracts.md) · [版本策略](docs/api/version-policy.md)
+- [AI 工程接入与迁移 Skill](.agents/skills/meguviz-ref/SKILL.md)
+- [核心 API](docs/api/core-contracts.md) · [安装说明](docs/installation.md) · [版本策略](docs/api/version-policy.md)
 - [Java 示例](samples/jvm-consumer) · [Kotlin 示例](samples/kotlin-consumer) · [Android 示例](samples/android-consumer)
 - [Apache License 2.0](LICENSE) · [版权与第三方声明](NOTICE)

@@ -1,14 +1,22 @@
 # 解析证据与代码身份
 
-`ResolutionReceipt` 是无运行对象的值记录：查询摘要、选择模式、结果状态、可见域、检查数量、完整性、描述符、reason与异常类型名。它不保存Throwable、Class、Member、receiver、loader或进程地址。运行scope token与portable receipt分离。
+## 1. 诊断收据 `ResolutionReceipt`
 
-`interruptionOrigin()` 是单次调用的运行时诊断，不写入 schema 1 的持久化 JSON；经旧构造器或持久化数据重建时为 `UNKNOWN`。不能从异常类型名重建原始 Throwable，也不能把反序列化或调用方构造的回执当作等待者身份的可信证明。具体使用条件见[核心 API](core-contracts.md)。
+`ResolutionReceipt` 是不含运行期对象的纯值记录，包含查询摘要、选择模式、结果状态、可见域、已检查数量、完整性标志、成员描述符、原因字符串与异常类型名。它不保存 `Throwable`、`Class`、`Member`、接收者、`ClassLoader` 或进程内引用，从而与运行期作用域令牌彻底隔离。
 
-`CodeIdentity.Strength` 区分STRONG、WEAK、UNVERIFIED。strong factory要求每个内容摘要是64位小写SHA-256，但不替调用方读文件；`CodeIdentities.hashFiles` 为可选实际文件hasher。文件mtime和版本号只能构造weak提示，不能命中持久化可信恢复。
+`interruptionOrigin()` 仅作为单次调用的运行时诊断信息，不写入 schema 1 的持久化 JSON；通过旧构造器或持久化数据重建时恒为 `UNKNOWN`。消费方不能凭异常类型名还原原始 `Throwable`，也不能将手工构造或反序列化的回执当作单飞等待者身份的可信证明。使用前提见[核心 API](core-contracts.md)。
 
-独立复验器不调用核心选择器：使用公开反射枚举，独立形成primitive/array/object描述并匹配owner、完整参数/返回与flags。签名缺类或公开API不可用产生UNAVAILABLE；不将未完成枚举归类成不存在。
+## 2. 代码身份 `CodeIdentity`
 
-测试实现见 [DiagnosticsContractTest](../../ref-diagnostics/src/test/java/io/github/jichuo1/meguviz/ref/diagnostics/DiagnosticsContractTest.java)；执行结果位于 `ref-diagnostics/build/test-results/contracts/`。
+`CodeIdentity.Strength` 区分 `STRONG`、`WEAK` 与 `UNVERIFIED` 三级：
 
+- **`STRONG`**：工厂方法要求每个制品摘要均为 64 位小写 SHA-256 十六进制字符串；`CodeIdentity.strong(...)` 本身不代读磁盘文件，可按需使用 `CodeIdentities.hashFiles(...)` 计算真实文件哈希。
+- **`WEAK` / `UNVERIFIED`**：文件修改时间（mtime）或版本号只能构成弱提示，不可用于命中持久化恢复。
+
+## 3. 独立复验器 `IndependentVerifier`
+
+独立复验器不调用核心查询选择器，而是通过公开反射枚举，独立构造基本类型、数组和对象类型的描述符，并校验声明类 `owner`、完整参数类型、返回类型及修饰符标志位。若签名中缺少类或公开反射 API 不可用，复验返回 `UNAVAILABLE`，不会把未完成枚举误判为“成员不存在”。
+
+对应合同测试见 [DiagnosticsContractTest](../../ref-diagnostics/src/test/java/io/github/jichuo1/meguviz/ref/diagnostics/DiagnosticsContractTest.java)，测试输出位于 `ref-diagnostics/build/test-results/contracts/`。
 
 [返回文档目录](../README.md)

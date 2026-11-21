@@ -1,9 +1,9 @@
 # 版本与兼容性
 
-库版本、Provider SPI 和持久化格式分别管理。稳定版本为 `1.0.0`；`main` 上的开发版本带 `-SNAPSHOT` 后缀（新增公开 API 按次版本递增），发布标签必须是去掉后缀的版本号。下一版本为 `1.2.0`（跳过从未发布的 `1.1.0`，与 Meguviz 家族统一版本），在 `release/1.2.0` 分支上定版。
+库版本、Provider SPI 和持久化格式分别独立管理。`1.0.0` 与 `1.2.0` 均已发布至 Maven Central（`1.1.0` 未单独发布，内容并入 `1.2.0` 以对齐 Meguviz 家族版本）。`main` 上的开发版本带 `-SNAPSHOT` 后缀（新增公开 API 按次版本递增），正式发布标签为去掉后缀的版本号。
 
 | 边界 | 当前约定 | 检查方式 |
-|---|---|---|
+| --- | --- | --- |
 | 公开 Java API | 以已提交的 API 基线为准 | `apiDump` 比较公开类型与签名，包括嵌套类型 |
 | Provider SPI | major 1 | 拒绝未知 major、无效依赖和不兼容注册 |
 | 持久化格式 | schema major 1 | 格式校验、内容身份检查与当前加载器重新解析 |
@@ -11,14 +11,12 @@
 
 ## 公开 API
 
-`verification/api-baseline/` 保存公开签名基线。差异应经过兼容性审查，不应在常规构建中自动覆盖。
-
-`verification/compatibility-clients/` 保存先前编译的 Java/Kotlin 测试客户端及其摘要。`verifyAbi` 使用当前 Maven 制品运行这些客户端，不重新编译它们。它们只用于测试，不随生产库分发。
-
-`CompatibilityPolicy.LEGACY_BIL` 是已有公开枚举名，表示严格装箱匹配策略。名称保留以维持源代码和二进制兼容；具体语义见[核心 API](core-contracts.md)。
+- `verification/api-baseline/` 保存公开签名基线。发生差异时必须经过兼容性审查，不能在常规构建中顺手覆盖。
+- `verification/compatibility-clients/` 保存旧版本编译的 Java/Kotlin 测试客户端及其摘要。`verifyAbi` 直接使用当前 Maven 制品运行这些客户端而不重新编译，用于验证二进制兼容性；这些客户端仅用于测试，不随生产库分发。
+- `CompatibilityPolicy.LEGACY_BIL` 是既有公开枚举名称，代表严格装箱匹配策略；保留该命名以维持源代码与二进制兼容，具体语义见[核心 API](core-contracts.md)。
 
 ## 格式与 SPI
 
-持久化数据不能绕过当前代码身份、加载器和访问策略校验。未知格式版本应明确失败。Provider 的版本协商独立于库版本，不能将提供方的覆盖声明直接视为完整性证明。
+持久化数据不能绕过当前代码身份、加载器和访问策略校验，遇到未知格式版本必须明确失败。Provider 的版本协商独立于库版本，不能将提供方的覆盖声明直接当作完整性证明。
 
 [返回文档目录](../README.md)

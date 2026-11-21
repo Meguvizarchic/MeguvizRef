@@ -3,22 +3,23 @@
 ## 使用
 
 | 文档 | 内容 |
-|---|---|
-| [安装](installation.md) | 模块选择、Gradle、Maven XML 与 JitPack 坐标 |
+| --- | --- |
+| [AI 接入与迁移 Skill](../.agents/skills/meguviz-ref/SKILL.md) | 工程盘点、模块选型、迁移范式与验证清单 |
+| [安装](installation.md) | 模块选择、Gradle、Maven XML 与 JitPack 坐标（`1.2.0`） |
 | [核心 API](api/core-contracts.md) | 描述符、查询、缓存、访问策略与作用域生命周期 |
 | [解析证据与代码身份](api/evidence-schema.md) | 诊断收据、代码摘要和独立复验 |
 | [持久化](api/persistence.md) | 存储格式、容量限制和恢复校验 |
 | [Provider SPI](api/spi-versioning.md) | Provider 注册、候选覆盖与生命周期 |
-| [性能说明](performance.md) | 1.2.0 开发版两轮性能改动的依据、jcstress 与变异检查、主机基准 |
+| [性能说明](performance.md) | 1.2.0 两轮性能改动的依据、jcstress 与变异检查、主机基准 |
 
 ## 开发与版本
 
 | 文档 | 内容 |
-|---|---|
+| --- | --- |
 | [构建与验证](development.md) | 工具链、验证命令和发布流程 |
 | [发布到 Maven Central](publishing-central.md) | 命名空间验证、签名与上传步骤 |
 | [兼容性](api/version-policy.md) | API、SPI、持久化格式及二进制兼容检查 |
-| [1.0.0 发布说明](releases/1.0.0.md) | 版本功能、验证范围和下载内容 |
-| [1.2.0 发布说明草稿](releases/1.2.0.md) | 未发布：新增 API、性能改动、行为说明与发布前检查 |
+| [1.0.0 发布说明](releases/1.0.0.md) | 1.0.0 版本功能、验证范围和下载内容 |
+| [1.2.0 发布说明](releases/1.2.0.md) | 1.2.0 新增 API、性能改动、行为说明与验证范围 |
 
 [返回项目首页](../README.md)

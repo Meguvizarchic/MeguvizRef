@@ -1,9 +1,11 @@
-# 性能说明（1.2.0 开发版）
+# 性能说明（1.2.0）
 
-本页记录 1.2.0 开发周期两轮性能改动的依据、验证方法、主机测量结果和后续方向。所有数据来自主机 JDK 17 x86-64，**不是 ART 或设备上的证据**；Android 上的收益需要设备基准另行确认。
+本页记录 1.2.0 两轮性能改动的依据、验证方法、主机测量结果和后续方向。
 
-- 第 1 轮：计划调用无锁准入、作用域构造、结构查询成员表、描述符与缓存命中、`resolveRaw`/`isCurrent`。
-- 第 2 轮：多线程共享作用域时的分段准入、jcstress 与变异检查、未命中路径（single-flight、覆盖范围字符串、精确描述符类型缓存）和桥接安装批量。
+> **适用范围与验证说明**：以下测量与并发校验数据均来自宿主 JDK 17 x86-64 环境，不代表 Android ART 运行时或真实设备的性能收益，设备端收益需在目标设备另行基准验证。
+
+- 第 1 轮：计划调用无锁并发计数、作用域构造、结构查询成员表、描述符与缓存命中、`resolveRaw` / `isCurrent`。
+- 第 2 轮：多线程共享作用域时的分段在途计数、jcstress 与变异检查、未命中路径（single-flight、覆盖范围字符串、精确描述符类型缓存）和桥接安装批量。
 
 ## 运行基准、jcstress 与变异检查
 
@@ -61,15 +63,15 @@ python3 tools/mutation_check.py --jcstress --only cells-before-base,cell-skips-b
 
 ## 第 1 轮改动与依据
 
-### 计划调用：无锁准入
+### 计划调用：无锁在途计数
 
-1.0.0 的每次计划调用进入两次作用域监视器（准入和释放），并用 `HashMap<Long, Slot>` 查槽位，槽位号超过 127 时每次调用都装箱。JDK 15 起偏向锁默认关闭（[JEP 374](https://openjdk.org/jeps/374)），无竞争的监视器也需要原子操作；多线程共享同一作用域时监视器竞争使单次调用升到约 1 µs。
+1.0.0 的每次计划调用进入两次作用域监视器（进入和释放），并用 `HashMap<Long, Slot>` 查槽位，槽位号超过 127 时每次调用都装箱。JDK 15 起偏向锁默认关闭（[JEP 374](https://openjdk.org/jeps/374)），无竞争的监视器也需要原子操作；多线程共享同一作用域时监视器竞争使单次调用升到约 1 µs。
 
 现在调用路径不进入监视器：
 
 1. 令牌对一个 volatile 绑定快照校验 identity、epoch、按下标寻址的槽位和描述符（先比较引用，同一槽位的令牌共享描述符实例）。
 2. 在途计数与关闭标志放在同一个原子整数里：只有关闭位未置位时才 CAS 计数加一。
-3. `close` 在锁内用一次 `getAndAdd` 置位关闭位，这是唯一的线性化点。之前准入的调用已计入并参与排空；之后的调用看到关闭位直接拒绝，不修改计数。
+3. `close` 在锁内用一次 `getAndAdd` 置位关闭位，这是唯一的线性化点。此前已进入的调用计入排空；之后的调用看到关闭位直接拒绝，不修改计数。
 
 没有采用"先自增再检查"：被拒绝的调用方可能成为最后一个释放者，从而在别的线程里执行 Provider 关闭，并让 `close()` 在没有真实在途工作时也不同步关闭 Provider。压力测试能捕获这种实现以及"非原子读取计数"的实现。该推理依赖 volatile 与原子操作的全局同步顺序（[JLS §17.4.4](https://docs.oracle.com/javase/specs/jls/se17/html/jls-17.html#jls-17.4.4)）。也测过把计数放到单独缓存行：4 线程结果差异在误差内（264±77 对 249±60 ns/op），因此未采用，避免每个作用域多分配约 150 字节。
 
@@ -107,31 +109,31 @@ Spring 的 `ReflectionUtils` 也缓存 `getDeclaredMethods()` 结果以避免新
 
 ## 第 2 轮改动与依据
 
-### 多线程计划调用：按竞争分段的准入计数
+### 多线程计划调用：按竞争分段的在途计数
 
 第 1 轮之后，每次计划调用仍对作用域的同一个原子整数做一次 CAS 加一和一次减一。多个线程共享一个作用域时，这个缓存行在核心之间来回迁移：基线在 1/2/4/8 线程下为 16.7/96/237/618 ns/op，而每个线程各用一个作用域时 4 线程约 21 ns/op。
 
-做法参考 `java.util.concurrent.atomic.Striped64`（`LongAdder` 的基础）：没有竞争时只更新一个基础字，CAS 失败才视为竞争并创建一组带填充的计数单元，按线程散列到单元（[JDK 17 源码](https://github.com/openjdk/jdk17u/blob/master/src/java.base/share/classes/java/util/concurrent/atomic/Striped64.java)，其注释说明数组中的原子量容易共享缓存行，所以单元需要填充）。准入还要求"关闭后拒绝、排空后恰好关闭一次 Provider"，因此在 Striped64 之上增加了关闭顺序和排空交接：
+做法参考 `java.util.concurrent.atomic.Striped64`（`LongAdder` 的基础）：没有竞争时只更新一个基础字，CAS 失败才视为竞争并创建一组带填充的计数单元，按线程散列到单元（[JDK 17 源码](https://github.com/openjdk/jdk17u/blob/master/src/java.base/share/classes/java/util/concurrent/atomic/Striped64.java)，其注释说明数组中的原子量容易共享缓存行，所以单元需要填充）。在途计数还要求“关闭后拒绝、排空后恰好关闭一次 Provider”，因此在 Striped64 之上增加了关闭顺序和排空交接：
 
 1. 基础字：低 30 位是在途数，第 30 位是 INFLATED，符号位是 CLOSING。无竞争的计划调用读一次基础字，在两个标志位都未置位时 CAS 加一；释放时减一并检查符号位，与第 1 轮的原子操作次数相同。
 2. 分段：某次调用在基础字上的 CAS 连续失败两次后，在作用域锁内创建单元表，然后给基础字置 INFLATED。表长是不小于处理器数的 2 的幂（2 至 64），单元相隔 32 个 int（128 字节，即 HotSpot `@Contended` 的默认填充宽度 [`ContendedPaddingWidth`](https://github.com/openjdk/jdk17u/blob/master/src/hotspot/share/runtime/globals.hpp)），首尾各留一段填充，8 核上约 1.3 KB。每个作用域最多创建一次，此后不再加锁。读到 INFLATED 且 CLOSING 未置位的调用按 `Thread.getId()` 选单元并 CAS 加一，冲突时探测下一个单元；解析仍在锁内计入基础字。
-3. 关闭顺序：close 在锁内先对基础字、再依次对每个单元执行 `getAndAdd(CLOSING)`。单元上的调用以"刚读到的基础字未关闭"作为准入检查。若调用 A 被拒绝，A 一定已经看到某个字的 CLOSING，而基础字最先置位，所以在 A 被拒绝之后才开始的调用 B 读基础字时一定看到 CLOSING。因此不会出现"一个调用被拒绝之后另一个调用仍被接受"，与单字时"close 的一次置位是线性化点"等价；单元 CAS 落在基础字关闭之后的调用，线性化在它读基础字的时刻。依据是 volatile 与原子操作的全局同步顺序（[JLS §17.4.4](https://docs.oracle.com/javase/specs/jls/se17/html/jls-17.html#jls-17.4.4)）。C-SNZI 的叶子到达也按"看到根仍开放的时刻"线性化，见下文。
-4. 排空交接：close 在置位前写入交接计数，初值为字数加一（基础字、全部单元和 close 自己），放在单元表前部的填充里，不增加作用域对象的大小。置位时计数为零的字由 close 代为交还份额；计数不为零的字，由其最后一个释放者（减一后看到"CLOSING 且计数为零"的那次）交还一份；close 最后交还自己的一份。交还总数恰好等于初值，取得最后一份的一方关闭 Provider：若在途工作在 close 的锁内阶段已全部结束，就是 close 本身，否则是最后释放的在途调用。被拒绝的调用方不修改任何计数或份额，因此不会执行 Provider 关闭。没有单元时仍是第 1 轮的单字协议。
+3. 关闭顺序：close 在锁内先对基础字、再依次对每个单元执行 `getAndAdd(CLOSING)`。单元上的调用以“刚读到的基础字未关闭”作为入口条件。若调用 A 被拒绝，A 一定已经看到某个字的 CLOSING，而基础字最先置位，所以在 A 被拒绝之后才开始的调用 B 读基础字时一定看到 CLOSING。因此不会出现“一个调用被拒绝之后另一个调用仍被接受”，与单字时“close 的一次置位是线性化点”等价；单元 CAS 落在基础字关闭之后的调用，线性化在它读基础字的时刻。依据是 volatile 与原子操作的全局同步顺序（[JLS §17.4.4](https://docs.oracle.com/javase/specs/jls/se17/html/jls-17.html#jls-17.4.4)）。C-SNZI 的叶子到达也按“看到根仍开放的时刻”线性化，见下文。
+4. 排空交接：close 在置位前写入交接计数，初值为字数加一（基础字、全部单元和 close 自己），放在单元表前部的填充里，不增加作用域对象的大小。置位时计数为零的字由 close 代为交还份额；计数不为零的字，由其最后一个释放者（减一后看到“CLOSING 且计数为零”的那次）交还一份；close 最后交还自己的一份。交还总数恰好等于初值，取得最后一份的一方关闭 Provider：若在途工作在 close 的锁内阶段已全部结束，就是 close 本身，否则是最后释放的在途调用。被拒绝的调用方不修改任何计数或份额，因此不会执行 Provider 关闭。没有单元时仍是第 1 轮的单字协议。
 5. 不变的部分：拒绝消息、epoch 语义、`diagnostics()` 的键；`inFlight` 是各字之和，静止时精确，并发变化时与 `LongAdder.sum()` 一样不一定对应某一时刻。`scopeOpenClose` 的分配仍是 376 B/op（新增的 `cells` 引用落在原有的对象对齐空隙里）。
 
-这与 BRAVO（[Dice & Kogan, USENIX ATC 2019](https://www.usenix.org/conference/atc19/presentation/dice)）一类"读者只写自己散列到的槽位，写者扫描整张表"的读者指示器相似；不同之处是 close 不等待在途调用结束，而是用份额把关闭交给最后一个离开者。
+这与 BRAVO（[Dice & Kogan, USENIX ATC 2019](https://www.usenix.org/conference/atc19/presentation/dice)）一类“读者只写自己散列到的槽位，写者扫描整张表”的读者指示器相似；不同之处是 close 不等待在途调用结束，而是用份额把关闭交给最后一个离开者。
 
 ### 为什么不用 SNZI
 
-SNZI（[Ellen, Lev, Luchangco, Moir, PODC 2007](https://dl.acm.org/doi/10.1145/1281100.1281106)）只回答"是否有剩余到达"，它的可关闭变体 C-SNZI（[Lev, Luchangco, Olszewski, SPAA 2009](https://people.csail.mit.edu/mareko/spaa09-scalablerwlocks.pdf)）在关闭后让到达失败、让最后一次离开得知已清空，关闭只修改根节点，语义上正好对应准入。但在它的树中，叶子计数从 0 变为 1 时要先到达父节点，叶子回到 0 时也要离开父节点。计划调用只持续十几纳秒，每个线程散列到的叶子几乎总在 0 和 1 之间往返，于是几乎每次调用都会更新根，竞争又集中到一个字上。SNZI 适合到达者在同一叶子上长时间重叠的场景（例如读写锁的读者），这里改用各线程独立计数、由 close 一次性扫描的分段方案。
+SNZI（[Ellen, Lev, Luchangco, Moir, PODC 2007](https://dl.acm.org/doi/10.1145/1281100.1281106)）只回答“是否有剩余到达”，它的可关闭变体 C-SNZI（[Lev, Luchangco, Olszewski, SPAA 2009](https://people.csail.mit.edu/mareko/spaa09-scalablerwlocks.pdf)）在关闭后让到达失败、让最后一次离开得知已清空，关闭只修改根节点，语义上正好对应在途计数控制。但在它的树中，叶子计数从 0 变为 1 时要先到达父节点，叶子回到 0 时也要离开父节点。计划调用只持续十几纳秒，每个线程散列到的叶子几乎总在 0 和 1 之间往返，于是几乎每次调用都会更新根，竞争又集中到一个字上。SNZI 适合到达者在同一叶子上长时间重叠的场景（例如读写锁的读者），这里改用各线程独立计数、由 close 一次性扫描的分段方案。
 
 ### 第 2 轮验证
 
-合同测试新增的准入用例：
+合同测试新增的并发计数与关闭用例：
 
 - 只在竞争时分段：单线程 2 万次调用和 200 次开关作用域都不创建单元；4 线程竞争后创建一次，之后不再替换，单元个数与间隔符合上文。
-- 排空顺序：分段后 3 个调用阻塞在单元、1 个 Provider 解析阻塞在基础字，close 后分别以"单元先排空"和"基础字最后排空"两种顺序释放，Provider 只在最后一个结束后关闭一次。
-- 竞态压力：自然竞争 100 轮、强制分段 150 轮，每轮 4 个工作线程与 close 竞争，检查在途时关闭、由未准入者关闭、close 返回后仍被准入、另一调用被拒绝后仍被准入、关闭后仍有目标进入以及关闭次数。并发 close 100 轮。
+- 排空顺序：分段后 3 个调用阻塞在单元、1 个 Provider 解析阻塞在基础字，close 后分别以“单元先排空”和“基础字最后排空”两种顺序释放，Provider 只在最后一个结束后关闭一次。
+- 竞态压力：自然竞争 100 轮、强制分段 150 轮，每轮 4 个工作线程与 close 竞争，检查在途时关闭、由被拒绝调用方关闭、close 返回后仍被接收、另一调用被拒绝后仍被接收、关闭后仍有目标进入以及关闭次数。并发 close 100 轮。
 - 中间状态：把分段作用域的基础字置为关闭而单元仍开放（close 第一步之后的状态），此时任何线程的调用都必须被拒绝；另有观察线程在 close 期间反复读取，确认不存在"某个单元已关闭而基础字仍开放"的时刻。
 - 其他：single-flight 只在出现等待者时创建 future；成员表视图跟随 LRU 尾部并随清空丢弃；最近项视图在写入后不再服务旧尾部；覆盖范围字符串不变；精确描述符类型缓存的加载器隔离、无负缓存、容量上限与丢弃。
 
@@ -193,7 +195,7 @@ MeguvizHook 桥接计划用一个作用域解析同一 owner 上的多个描述�
 
 ## MethodHandle / LambdaMetafactory 调研（未采用）
 
-- JDK 18 起核心反射本身改用 method handle 实现（[JEP 416](https://openjdk.org/jeps/416)）。JDK 17 的 `Method.invoke` 前若干次走本地实现，之后生成字节码访问器。上表中直接 `Method.invoke` 约 3.8 ns，计划调用剩余开销主要来自准入，不在反射调用本身。
+- JDK 18 起核心反射本身改用 method handle 实现（[JEP 416](https://openjdk.org/jeps/416)）。JDK 17 的 `Method.invoke` 前若干次走本地实现，之后生成字节码访问器。上表中直接 `Method.invoke` 约 3.8 ns，计划调用剩余开销主要来自在途计数与状态校验，不在反射调用本身。
 - 语义不同。`MethodHandle.invokeWithArguments` 原样抛出目标异常，不包装为 `InvocationTargetException`；类型不符时抛 `ClassCastException` 或 `WrongMethodTypeException`，而不是 `IllegalArgumentException`（[Android MethodHandle 文档](https://developer.android.com/reference/java/lang/invoke/MethodHandle)）。访问检查发生在查找时而不是每次调用，调用者敏感方法看到的调用者也不同。
 - Android 上 `MethodHandle.invoke`/`invokeExact` 需要 minSdk 26；lambda 由 D8/R8 在构建期脱糖（[Java 8 支持说明](https://developer.android.com/studio/write/java8-support)），运行时不能依赖 `LambdaMetafactory`。
 
@@ -274,8 +276,8 @@ MeguvizHook 桥接计划用一个作用域解析同一 owner 上的多个描述�
 
 ## 后续方向
 
-1. 在 ART 设备上验证分段准入、成员表与类型缓存（`samples/android-consumer`），补充设备证据；手机大小核的缓存行为与 x86 SMT 不同。
-2. MeguvizHook 桥接在 1.2.0 发布后：安装批量共用一个作用域并改用 `resolveRaw`（不累计 binding），会话的身份检查改用一次加锁的 `isCurrent`。
+1. 在 ART 设备上验证分段在途计数、成员表与类型缓存（`samples/android-consumer`），补充设备数据；手机大小核的缓存行为与 x86 SMT 不同。
+2. MeguvizHook 桥接在 `1.2.0` 已采用 `resolveRaw`（避免累计 binding）和 `isCurrent`（单次加锁合并检查）。
 3. 回执与结果的内部免复制构造需要跨包 API，若将来调整包结构可再评估。
 4. jcstress 目前只在 x86 主机上运行；如有 ARM 主机，补跑一次完整组合。
 

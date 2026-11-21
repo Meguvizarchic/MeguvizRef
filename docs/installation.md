@@ -1,9 +1,8 @@
 # 安装
 
-要求：JDK 17；Android 模块要求 API 27 或更高版本。
+要求：JDK 17；Android 模块要求 `minSdk 27`（API 27）及 `compileSdk 37` 或更高版本。
 
-
-推荐从 Maven Central 获取，无需额外配置仓库：
+推荐从 Maven Central 获取，无需额外配置私有仓库：
 
 ```kotlin
 // settings.gradle.kts
@@ -18,17 +17,20 @@ dependencyResolutionManagement {
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("io.github.jichuo1.meguviz:meguviz-ref-core:1.0.0")
+    implementation(platform("io.github.jichuo1.meguviz:meguviz-bom:1.2.0"))
+    implementation("io.github.jichuo1.meguviz:meguviz-ref-core")
     // 可选：结构化诊断与持久化收据
-    implementation("io.github.jichuo1.meguviz:meguviz-ref-diagnostics:1.0.0")
+    implementation("io.github.jichuo1.meguviz:meguviz-ref-diagnostics")
     // 可选：Android API 27+ 辅助功能
-    implementation("io.github.jichuo1.meguviz:meguviz-ref-android:1.0.0")
+    implementation("io.github.jichuo1.meguviz:meguviz-ref-android")
 }
 ```
 
+若不使用 BOM，也可直接在各坐标末尾显式填写 `:1.2.0`。
+
 ## 备用来源：GitHub 托管的 Maven 仓库
 
-同样的制品也发布在本仓库的 `maven` 分支，无需令牌或登录。这里只开放本库 group，避免覆盖其他依赖来源：
+同样的制品也发布在本仓库的 `maven` 分支，无需令牌或登录。配置时建议仅开放本库 group，避免覆盖其他依赖来源：
 
 ```kotlin
 // settings.gradle.kts
@@ -43,7 +45,7 @@ dependencyResolutionManagement {
 }
 ```
 
-Maven 消费者：
+Maven 消费者配置：
 
 ```xml
 <repositories>
@@ -56,12 +58,12 @@ Maven 消费者：
   <dependency>
     <groupId>io.github.jichuo1.meguviz</groupId>
     <artifactId>meguviz-ref-core</artifactId>
-    <version>1.0.0</version>
+    <version>1.2.0</version>
   </dependency>
 </dependencies>
 ```
 
-JitPack 使用独立坐标，不应与上述坐标混用：
+JitPack 使用独立坐标，不应与上述 Maven Central 坐标混用：
 
 ```kotlin
 repositories {
@@ -70,13 +72,13 @@ repositories {
     }
 }
 dependencies {
-    implementation("com.github.jichuo1.MeguvizRef:meguviz-ref-core:1.0.0")
+    implementation("com.github.jichuo1.MeguvizRef:meguviz-ref-core:1.2.0")
     // 同组另有 meguviz-ref-diagnostics 与 meguviz-ref-android
 }
 ```
 
 ## 模块选择
 
-核心模块可单独使用。诊断与 Android 模块都依赖 core，按需引入即可。只在项目中选择一种仓库坐标体系，避免将同一套类重复加入运行时。
+核心模块可单独使用。诊断与 Android 模块都传递依赖 `meguviz-ref-core`，按需引入即可。项目中应只选择一种仓库坐标体系，避免将同一套类重复打入运行时。
 
 [返回文档目录](README.md)

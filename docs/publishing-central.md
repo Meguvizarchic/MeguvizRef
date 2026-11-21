@@ -6,9 +6,9 @@
 
 ## Central 对制品的要求
 
-- 每个模块有 `.pom`、`.jar`（或 `.aar`）、`-sources.jar`、`-javadoc.jar`。
-- 每个文件有 GPG 签名 `.asc`，以及 `.md5`、`.sha1` 校验文件。
-- POM 含 name、description、url、license、developer、scm。
+- 每个模块具备 `.pom`、`.jar`（或 `.aar`）、`-sources.jar`、`-javadoc.jar`。
+- 每个文件具备 GPG 签名 `.asc`，以及 `.md5`、`.sha1` 校验文件。
+- POM 包含 `name`、`description`、`url`、`license`、`developer`、`scm`。
 
 构建已按此配置：加上 `-Pmeguviz.central=true` 后，会生成 javadoc 包、对发布内容签名，并输出到 `build/central-staging`。不加该参数时，日常构建与验证行为不变。
 
@@ -24,20 +24,22 @@
 .\gradlew.bat '-Pmeguviz.profile=android' '-Pmeguviz.central=true' '-Psigning.gnupg.executable=<gpg 可执行文件路径>' '-Psigning.gnupg.keyName=<KEY_ID>' centralBundle
 ```
 
-- 需要 `android` profile，才会包含 `meguviz-ref-android`。
+- 需要启用 `android` profile，才会包含 `meguviz-ref-android`。
 - 签名时会弹出 Pinentry 窗口，输入 GPG 口令。
-- 结果为 `build/central/meguviz-ref-<版本>-central.zip`，内含三个模块的全部文件、签名和校验文件。
+- 产物为 `build/central/meguviz-ref-<版本>-central.zip`，内含三个模块的全部文件、签名和校验文件。
 
 ## 上传与发布
 
 1. 打开 <https://central.sonatype.com/publishing>，点击 Publish Component。
-2. 填写 Deployment Name（如 `meguviz-ref-1.0.0`），选择上面生成的 zip 上传。
+2. 填写 Deployment Name（如 `meguviz-ref-1.2.0`），选择上面生成的 zip 上传。
 3. 等待 Portal 校验通过（签名、POM 元数据、校验和）。失败时按报错修复后重新生成并上传。
 4. 校验通过后点击 Publish。通常几十分钟后可在 <https://repo1.maven.org/maven2/io/github/jichuo1/meguviz/> 查到。
 
-**同一版本一旦发布到 Central，不能覆盖或删除。** 上传前确认版本号和内容无误。
+**同一版本一旦发布到 Central，不能覆盖或删除。** 上传前请确认版本号和内容无误。
 
 ## 发布后
 
 - 保留 `maven` 分支作为备用来源。
 - 验证：新建空项目，只配置 `mavenCentral()`，解析 `io.github.jichuo1.meguviz:meguviz-ref-core:<版本>`。
+
+[返回文档目录](README.md)
